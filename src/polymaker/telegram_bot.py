@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import time
 import uuid
@@ -128,6 +129,10 @@ class TelegramBot:
     async def _api(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self._secrets:
             return {}
+        # httpx INFO logs full request URLs; Telegram puts the token in the path.
+        httpx_log = logging.getLogger("httpx")
+        prev_level = httpx_log.level
+        httpx_log.setLevel(logging.WARNING)
         try:
             async with httpx.AsyncClient(**self._client_kwargs()) as client:
                 r = await client.post(self._url(method), json=payload or {})
@@ -140,6 +145,8 @@ class TelegramBot:
         except httpx.HTTPError as exc:
             log.warning("telegram_api_failed", method=method, err=type(exc).__name__)
             return {}
+        finally:
+            httpx_log.setLevel(prev_level)
 
     async def send(self, text: str, *, reply_markup: dict[str, Any] | None = None) -> int | None:
         """Send a plain text message to the configured chat. Returns message_id."""
@@ -276,7 +283,9 @@ class TelegramBot:
             log.info("telegram_disabled")
             return
         log.info("telegram_poll_started", confirm=self.confirm_enabled)
-        await self.send("polymaker telegram online")
+        await self.send(
+            "polymaker telegram 已上线。可发 hi / 在吗 / /status；发 /help 看命令。"
+        )
         while not self._stop.is_set():
             try:
                 await self._poll_once()

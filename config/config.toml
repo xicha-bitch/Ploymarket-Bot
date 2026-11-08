@@ -21,11 +21,11 @@ journal = true
 loop = "uvloop"
 
 [risk]
-# Sized for ~$20–30 USDC/pUSD starting capital (from polymarket-terminal small-size ethos)
-max_total_exposure_usdc = 25.0
-max_event_group_loss_usdc = 20.0
-max_market_notional_usdc = 12.0
-daily_loss_kill_usdc = 4.0
+# Sized for ~$1 USDC/pUSD micro live start (wallet may hold more; these are hard caps)
+max_total_exposure_usdc = 1.0
+max_event_group_loss_usdc = 0.8
+max_market_notional_usdc = 0.55
+daily_loss_kill_usdc = 0.2
 ws_stale_halt_s = 10.0
 user_ws_blind_halt_s = 15.0
 heartbeat_halt_failures = 3

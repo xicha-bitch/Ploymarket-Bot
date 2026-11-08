@@ -10,7 +10,12 @@ import httpx
 import pytest
 import respx
 
-from polymaker.telegram_bot import TelegramBot, TelegramSecrets, telegram_configured
+from polymaker.telegram_bot import (
+    TelegramBot,
+    TelegramSecrets,
+    parse_notify_mode,
+    telegram_configured,
+)
 
 
 def test_telegram_configured_checks_names_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,7 +54,7 @@ def test_needs_confirm_first_day_and_size_bump() -> None:
     assert "size increase" in reason2
 
 
-def test_confirm_disabled_notifies_but_passes() -> None:
+def test_confirm_disabled_passes_silently() -> None:
     secrets = TelegramSecrets(token="t", chat_id="1", confirm=False)
     bot = TelegramBot(secrets)
     assert bot.needs_confirm(9.0) == (False, "")
@@ -60,9 +65,57 @@ def test_confirm_disabled_notifies_but_passes() -> None:
             return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
         )
         assert await bot.request_confirm("would ask") is True
-        assert route.called
+        assert not route.called
 
     asyncio.run(_go())
+
+
+def test_parse_notify_mode_defaults_quiet() -> None:
+    assert parse_notify_mode(None) == "quiet"
+    assert parse_notify_mode("") == "quiet"
+    assert parse_notify_mode("quiet") == "quiet"
+    assert parse_notify_mode("fills") == "fills"
+    assert parse_notify_mode("fills_only") == "fills"
+    assert parse_notify_mode("all") == "all"
+
+
+@respx.mock
+def test_quiet_mode_suppresses_auto_pushes() -> None:
+    secrets = TelegramSecrets(token="t", chat_id="1", confirm=False, notify_mode="quiet")
+    bot = TelegramBot(secrets)
+    assert bot.push_fills is False
+    assert bot.push_place_events is False
+    assert bot.push_periodic is False
+    route = respx.post(url__regex=r"https://api\.telegram\.org/bot.*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+    )
+
+    async def _go() -> None:
+        await bot.notify_fill(side="BUY", price=0.4, size=2.0, token_hint="abc")
+        await bot.notify_place_failed(n=2, detail="x")
+        await bot.notify_status("periodic")
+
+    asyncio.run(_go())
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_fills_only_pushes_fills() -> None:
+    secrets = TelegramSecrets(token="t", chat_id="1", confirm=False, notify_mode="fills")
+    bot = TelegramBot(secrets)
+    assert bot.push_fills is True
+    assert bot.push_place_events is False
+    route = respx.post(url__regex=r"https://api\.telegram\.org/bot.*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 2}})
+    )
+
+    async def _go() -> None:
+        await bot.notify_fill(side="SELL", price=0.5, size=1.0, token_hint="xyz")
+        await bot.notify_place_failed(n=1)
+        await bot.notify_status("nope")
+
+    asyncio.run(_go())
+    assert route.call_count == 1
 
 
 @respx.mock

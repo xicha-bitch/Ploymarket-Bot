@@ -9,6 +9,7 @@ Project docs (`polymarket-telegram-bot.md`).
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_CONFIRM=0
+TELEGRAM_NOTIFY=quiet
 ```
 
 **If a token was ever pasted into chat:** treat it as leaked. In
@@ -25,16 +26,23 @@ chat-pasted token.
 
 ## Behaviour
 
+Default is **quiet**: no periodic status spam, no place/cancel / place-failed
+pushes. Replies to user messages and `/status` `/pnl` `/stop` still work.
+
+| `TELEGRAM_NOTIFY` | Auto pushes |
+|-------------------|-------------|
+| `quiet` (default) | none |
+| `fills` | fills only |
+| `all` | fills + place failures + ~15 min status (legacy) |
+
 | Hook | What happens |
 |------|----------------|
-| Fill | Telegram push |
-| Place failure / partial | Telegram push |
-| Every ~15 min | Status summary |
+| User chat / commands | Always (when configured) |
 | `/start` `/help` | Chinese command help |
 | `/status` `/pnl` `/stop` | Commands in the configured chat |
 | `hi` / `在吗` / `跟我聊天` | Short friendly ACK (trading notify bot) |
 | `天气` | Explains weather is unsupported; use `/status` |
-| other text | Short Chinese help pointer |
+| Fill / place-fail / periodic | Only per `TELEGRAM_NOTIFY` above |
 | `TELEGRAM_CONFIRM=1` | Inline Approve/Deny before first place of day or size bump |
 
 Unconfigured → no-op (trading continues). Never log token or chat id values.

@@ -39,7 +39,12 @@ from polymaker.strategy.estimators import (
 )
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
-from polymaker.telegram_bot import TelegramBot, TelegramSecrets, schedule_notify
+from polymaker.telegram_bot import (
+    TelegramBot,
+    TelegramSecrets,
+    parse_notify_mode,
+    schedule_notify,
+)
 from polymaker.userstream.client import UserStream
 
 log = get_logger("engine")
@@ -96,10 +101,15 @@ class Engine:
                 token=cfg.secrets.telegram_bot_token or "",
                 chat_id=cfg.secrets.telegram_chat_id or "",
                 confirm=bool(cfg.secrets.telegram_confirm),
+                notify_mode=parse_notify_mode(cfg.secrets.telegram_notify),
             )
         bot = TelegramBot(secrets, proxy=cfg.proxy)
         if bot.enabled:
-            log.info("telegram_enabled", confirm=bot.confirm_enabled)
+            log.info(
+                "telegram_enabled",
+                confirm=bot.confirm_enabled,
+                notify=bot.notify_mode,
+            )
         else:
             log.info("telegram_disabled")
         return bot
@@ -142,7 +152,7 @@ class Engine:
         for cid in self.metas:
             self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
         self._spawn("supervisor", self._supervise)
-        # Telegram is a side-channel: poll commands + periodic status (no-op if unset)
+        # Telegram side-channel: command poll always; periodic push only if notify=all
         self.telegram.bind(
             status=self._telegram_status_text,
             pnl=self._telegram_pnl_text,
@@ -150,7 +160,8 @@ class Engine:
         )
         if self.telegram.enabled:
             self._spawn("telegram", self.telegram.run_forever)
-            self._spawn("telegram_status", self.telegram.run_status_loop)
+            if self.telegram.push_periodic:
+                self._spawn("telegram_status", self.telegram.run_status_loop)
         self.risk.reset_day()
         log.info("engine_started", markets=len(self.metas))
 

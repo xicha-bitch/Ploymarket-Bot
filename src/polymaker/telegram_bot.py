@@ -1,8 +1,9 @@
 """Telegram notify/control side-channel for polymaker.
 
 Uses the Bot HTTP API via httpx (no extra dependency). Optional:
-  - push fills / place failures / periodic status
-  - /status /pnl /stop commands (long-poll)
+  - quiet by default: no periodic/status spam, no place/cancel pushes
+  - TELEGRAM_NOTIFY=fills for fills-only pushes; =all for legacy spam
+  - /status /pnl /stop + chat replies always work when configured
   - approve/deny confirm gate before first place of day or size bumps
 
 Secrets come only from env (.env locally). Never log token or chat values.
@@ -16,12 +17,11 @@ import asyncio
 import contextlib
 import logging
 import os
-import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -32,13 +32,25 @@ log = get_logger("telegram")
 _API = "https://api.telegram.org"
 _POLL_TIMEOUT_S = 25
 _DEFAULT_CONFIRM_TIMEOUT_S = 90.0
-_STATUS_INTERVAL_S = 900.0  # 15 min
+_STATUS_INTERVAL_S = 900.0  # 15 min (only when TELEGRAM_NOTIFY=all)
+
+NotifyMode = Literal["quiet", "fills", "all"]
 
 
 def _env_present(name: str) -> bool:
     """True if the env key exists and is non-empty. Never returns the value."""
     v = os.environ.get(name)
     return bool(v and v.strip())
+
+
+def parse_notify_mode(raw: str | None) -> NotifyMode:
+    """Map TELEGRAM_NOTIFY to quiet|fills|all. Default quiet (no auto spam)."""
+    v = (raw or "quiet").strip().lower()
+    if v in ("all", "full", "verbose", "1", "true", "yes", "on"):
+        return "all"
+    if v in ("fills", "fill", "fills_only", "fills-only"):
+        return "fills"
+    return "quiet"
 
 
 def telegram_configured() -> bool:
@@ -53,6 +65,7 @@ class TelegramSecrets:
     token: str
     chat_id: str
     confirm: bool = False
+    notify_mode: NotifyMode = "quiet"
 
     @classmethod
     def from_env(cls) -> TelegramSecrets | None:
@@ -62,7 +75,8 @@ class TelegramSecrets:
             return None
         confirm_raw = (os.environ.get("TELEGRAM_CONFIRM") or "").strip().lower()
         confirm = confirm_raw in ("1", "true", "yes", "on")
-        return cls(token=token, chat_id=chat_id, confirm=confirm)
+        mode = parse_notify_mode(os.environ.get("TELEGRAM_NOTIFY"))
+        return cls(token=token, chat_id=chat_id, confirm=confirm, notify_mode=mode)
 
 
 StatusProvider = Callable[[], Awaitable[str] | str]
@@ -103,6 +117,23 @@ class TelegramBot:
     @property
     def confirm_enabled(self) -> bool:
         return bool(self._secrets and self._secrets.confirm)
+
+    @property
+    def notify_mode(self) -> NotifyMode:
+        return self._secrets.notify_mode if self._secrets else "quiet"
+
+    @property
+    def push_fills(self) -> bool:
+        return self.notify_mode in ("fills", "all")
+
+    @property
+    def push_place_events(self) -> bool:
+        """Place/cancel / place-failed auto pushes (legacy noise)."""
+        return self.notify_mode == "all"
+
+    @property
+    def push_periodic(self) -> bool:
+        return self.notify_mode == "all"
 
     def bind(
         self,
@@ -184,6 +215,8 @@ class TelegramBot:
         token_hint: str,
         trade_id: str | None = None,
     ) -> None:
+        if not self.push_fills:
+            return
         notional = price * size
         tid = f" id={trade_id[:12]}" if trade_id else ""
         await self.send(
@@ -192,10 +225,14 @@ class TelegramBot:
         )
 
     async def notify_place_failed(self, *, n: int, detail: str = "") -> None:
+        if not self.push_place_events:
+            return
         extra = f" — {detail[:200]}" if detail else ""
         await self.send(f"❌ PLACE FAILED ({n} quotes){extra}")
 
     async def notify_status(self, text: str) -> None:
+        if not self.push_periodic:
+            return
         await self.send(text)
 
     # ── confirm gate ────────────────────────────────────────────────────
@@ -236,8 +273,7 @@ class TelegramBot:
         if not self.enabled:
             return True
         if not self.confirm_enabled:
-            # notify-only path still ready when confirm flag is off
-            await self.send(f"ℹ️ would ask confirm: {reason}" + (f"\n{detail}" if detail else ""))
+            # Quiet by default: do not spam "would ask confirm" when gate is off.
             return True
 
         req_id = uuid.uuid4().hex[:10]
@@ -282,9 +318,14 @@ class TelegramBot:
         if not self.enabled:
             log.info("telegram_disabled")
             return
-        log.info("telegram_poll_started", confirm=self.confirm_enabled)
+        log.info(
+            "telegram_poll_started",
+            confirm=self.confirm_enabled,
+            notify=self.notify_mode,
+        )
         await self.send(
-            "polymaker telegram 已上线。可发 hi / 在吗 / /status；发 /help 看命令。"
+            "polymaker telegram 已上线（安静模式：不主动刷状态/下单）。"
+            "可发 hi / 在吗 / /status；发 /help 看命令。"
         )
         while not self._stop.is_set():
             try:
@@ -296,8 +337,8 @@ class TelegramBot:
                 await asyncio.sleep(2.0)
 
     async def run_status_loop(self) -> None:
-        """Periodic status push. No-op when unconfigured."""
-        if not self.enabled:
+        """Periodic status push. Only when TELEGRAM_NOTIFY=all."""
+        if not self.enabled or not self.push_periodic:
             return
         while not self._stop.is_set():
             try:
@@ -365,7 +406,9 @@ class TelegramBot:
             "/stop — 撤单并暂停下单\n"
             "/help — 本说明\n\n"
             "也可发「hi」「在吗」「跟我聊天」测连通；"
-            "不查天气，交易状态请用 /status。"
+            "不查天气，交易状态请用 /status。\n\n"
+            "默认安静：不推送周期状态/下单噪音。"
+            "需要成交推送时设 TELEGRAM_NOTIFY=fills。"
         )
 
     @staticmethod

@@ -9,6 +9,7 @@
   polymaker capital-check        verify risk caps vs bankroll
   polymaker fee-estimate         estimate taker fees for a hypothetical fill
   polymaker cancel-all           panic button
+  polymaker telegram-smoke       send 'bot linked' if TELEGRAM_* set
 """
 
 from __future__ import annotations
@@ -340,6 +341,36 @@ def cancel_all(config_dir: str = typer.Option("config", help="config directory")
 
     asyncio.run(_go())
     console.print("[green]Sent cancel-all.[/green]")
+
+
+@app.command(name="telegram-smoke")
+def telegram_smoke() -> None:
+    """Send a one-line 'bot linked' message if TELEGRAM_* env keys are set.
+
+    Never prints token or chat id — only whether the send succeeded.
+    """
+    from dotenv import load_dotenv
+
+    from polymaker.telegram_bot import TelegramBot, telegram_configured
+
+    # Load local .env into process env before presence check / send.
+    # Values are never printed — only key-name presence is checked.
+    load_dotenv()
+
+    if not telegram_configured():
+        console.print(
+            "[yellow]Telegram not configured.[/yellow] "
+            "Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to local .env "
+            "(never paste them into chat)."
+        )
+        raise typer.Exit(1)
+
+    ok = asyncio.run(TelegramBot().smoke_send())
+    if ok:
+        console.print("[green]Smoke OK — check Telegram for 'bot linked'.[/green]")
+    else:
+        console.print("[red]Smoke send failed (token/chat wrong or network).[/red]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

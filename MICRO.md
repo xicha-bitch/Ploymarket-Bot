@@ -27,6 +27,8 @@ Copy `.env.example` → `.env` on **your** machine:
 | `PK` | yes | Signer private key (hot wallet only) |
 | `BROWSER_ADDRESS` | yes | Polymarket deposit/funder address from the UI |
 | `POLYGON_RPC` | optional | Custom Polygon RPC |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | Notify/control side-channel (see [TELEGRAM.md](TELEGRAM.md)) |
+| `TELEGRAM_CONFIRM` | optional | `1` = Approve/Deny before first place of day / size bumps |
 | `POLY_BUILDER_KEY` / `SECRET` / `PASSPHRASE` | only if merge via relayer | Builder API creds |
 | `POLY_RELAYER_URL` | optional | Default relayer URL is fine for most |
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import httpx
@@ -101,6 +102,35 @@ def test_handle_commands_status_pnl_stop() -> None:
     assert on_stop.await_count == 1
     assert bot.stop_requested is True
     assert send_route.call_count >= 3
+
+
+@respx.mock
+def test_handle_chat_replies_chinese() -> None:
+    secrets = TelegramSecrets(token="t", chat_id="55", confirm=False)
+    bot = TelegramBot(secrets)
+    send_route = respx.post(url__regex=r"https://api\.telegram\.org/bot.*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 9}})
+    )
+
+    async def _go() -> list[str]:
+        texts: list[str] = []
+        for t in ("/start", "hi", "在吗？", "跟我聊天", "天气怎么样", "随便说说", "/help"):
+            await bot._handle_message({"chat": {"id": 55}, "text": t})
+        for call in send_route.calls:
+            payload = json.loads(call.request.content)
+            texts.append(payload["text"])
+        return texts
+
+    replies = asyncio.run(_go())
+    assert len(replies) == 7
+    assert "交易通知 bot" in replies[0]
+    assert "/status" in replies[0]
+    assert "交易通知 bot" in replies[1]
+    assert "交易通知 bot" in replies[2]
+    assert "交易通知 bot" in replies[3]
+    assert "不会查天气" in replies[4]
+    assert "/help" in replies[5]
+    assert "交易通知 bot" in replies[6]
 
 
 @respx.mock

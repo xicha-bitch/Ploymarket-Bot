@@ -346,35 +346,66 @@ class TelegramBot:
         if cq_id:
             await self._api("answerCallbackQuery", {"callback_query_id": cq_id})
 
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "你好，我是 Polymarket 交易通知 bot。\n\n"
+            "命令：\n"
+            "/status — 仓位与挂单\n"
+            "/pnl — 权益 / 当日 PnL\n"
+            "/stop — 撤单并暂停下单\n"
+            "/help — 本说明\n\n"
+            "也可发「hi」「在吗」「跟我聊天」测连通；"
+            "不查天气，交易状态请用 /status。"
+        )
+
+    @staticmethod
+    def _normalize_chat_text(text: str) -> str:
+        """Lowercase + strip common punctuation for casual matching."""
+        t = text.strip().lower()
+        for ch in "！!？?。.~～…、，,":
+            t = t.replace(ch, "")
+        return t.strip()
+
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         chat = (msg.get("chat") or {}).get("id")
         if not self._secrets or str(chat) != str(self._secrets.chat_id):
             return
         text = str(msg.get("text") or "").strip()
-        if not text.startswith("/"):
+        if not text:
             return
-        cmd = text.split()[0].split("@", 1)[0].lower()
-        if cmd == "/status":
-            body = await self._call_provider(self._status_provider) or "(no status provider)"
-            await self.send(f"📊 status\n{body}")
-        elif cmd == "/pnl":
-            body = await self._call_provider(self._pnl_provider) or "(no pnl provider)"
-            await self.send(f"📈 pnl\n{body}")
-        elif cmd == "/stop":
-            self.stop_requested = True
-            await self.send("🛑 stop requested — cancelling quotes")
-            if self._on_stop is not None:
-                result = self._on_stop()
-                if asyncio.iscoroutine(result):
-                    await result
-        elif cmd == "/help":
+
+        if text.startswith("/"):
+            cmd = text.split()[0].split("@", 1)[0].lower()
+            if cmd in ("/start", "/help"):
+                await self.send(self._help_text())
+            elif cmd == "/status":
+                body = await self._call_provider(self._status_provider) or "(暂无状态数据)"
+                await self.send(f"📊 状态\n{body}")
+            elif cmd == "/pnl":
+                body = await self._call_provider(self._pnl_provider) or "(暂无 PnL 数据)"
+                await self.send(f"📈 PnL\n{body}")
+            elif cmd == "/stop":
+                self.stop_requested = True
+                await self.send("🛑 已请求停止 — 正在撤单并暂停下单")
+                if self._on_stop is not None:
+                    result = self._on_stop()
+                    if asyncio.iscoroutine(result):
+                        await result
+            else:
+                await self.send(f"未知命令 {cmd}。发 /help 看可用命令。")
+            return
+
+        norm = self._normalize_chat_text(text)
+        if norm in ("hi", "hello", "hey", "在吗", "在么", "在不在", "跟我聊天", "聊天"):
             await self.send(
-                "commands:\n/status — positions & open orders\n"
-                "/pnl — equity / daily PnL\n/stop — cancel quotes & halt\n"
-                "inline Approve/Deny on confirm prompts"
+                "在的 🙂 我是交易通知 bot，不是闲聊助手。"
+                "要看交易状态发 /status，更多命令 /help。"
             )
+        elif "天气" in norm:
+            await self.send("我不会查天气～这是交易通知 bot。看交易状态请发 /status。")
         else:
-            await self.send(f"unknown command {cmd}. try /help")
+            await self.send("没听懂。试试 /help，或发 /status 看交易状态。")
 
     async def _call_provider(self, provider: StatusProvider | PnlProvider | None) -> str:
         if provider is None:

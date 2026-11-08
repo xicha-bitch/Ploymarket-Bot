@@ -30,7 +30,11 @@ chat-pasted token.
 | Fill | Telegram push |
 | Place failure / partial | Telegram push |
 | Every ~15 min | Status summary |
+| `/start` `/help` | Chinese command help |
 | `/status` `/pnl` `/stop` | Commands in the configured chat |
+| `hi` / `在吗` / `跟我聊天` | Short friendly ACK (trading notify bot) |
+| `天气` | Explains weather is unsupported; use `/status` |
+| other text | Short Chinese help pointer |
 | `TELEGRAM_CONFIRM=1` | Inline Approve/Deny before first place of day or size bump |
 
 Unconfigured → no-op (trading continues). Never log token or chat id values.

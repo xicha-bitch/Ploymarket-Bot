@@ -349,9 +349,14 @@ def telegram_smoke() -> None:
 
     Never prints token or chat id — only whether the send succeeded.
     """
+    from dotenv import load_dotenv
+
     from polymaker.telegram_bot import TelegramBot, telegram_configured
 
-    # Presence check only (key names); values never printed.
+    # Load local .env into process env before presence check / send.
+    # Values are never printed — only key-name presence is checked.
+    load_dotenv()
+
     if not telegram_configured():
         console.print(
             "[yellow]Telegram not configured.[/yellow] "

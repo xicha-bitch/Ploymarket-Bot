@@ -34,9 +34,11 @@ Also set `signature_type` in `config/config.toml` to match your account (often `
 
 ## Live path
 
+Full clone → install → secrets → start: **[DEPLOY.md](DEPLOY.md)**.
+
 ```bash
 uv sync --extra dev
-cp .env.example .env          # fill PK + BROWSER_ADDRESS locally
+cp .env.example .env          # fill PK + BROWSER_ADDRESS locally (never paste into chat)
 uv run polymaker capital-check --bankroll 25
 uv run polymaker doctor
 uv run polymaker scan

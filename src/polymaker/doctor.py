@@ -178,7 +178,7 @@ def _extract_balance(ba: dict[str, Any]) -> float | None:
         if k in ba:
             try:
                 v = float(ba[k])
-                return v / 1e6 if v > 1e6 else v
+                return v / 1e6
             except (ValueError, TypeError):
                 return None
     return None

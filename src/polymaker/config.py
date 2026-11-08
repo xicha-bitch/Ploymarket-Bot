@@ -168,6 +168,13 @@ class Secrets(BaseSettings):
     browser_address: str = Field(default="", alias="BROWSER_ADDRESS")
     polygon_rpc: str | None = Field(default=None, alias="POLYGON_RPC")
     alert_webhook_url: str | None = Field(default=None, alias="ALERT_WEBHOOK_URL")
+    # Telegram notify/control side-channel (optional). Never log these values.
+    telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")
+    # When true, first place of day / size bumps wait for Approve/Deny inline buttons.
+    telegram_confirm: bool = Field(default=False, alias="TELEGRAM_CONFIRM")
+    # Auto-push mode: quiet (default) | fills | all. Commands/replies always work.
+    telegram_notify: str = Field(default="quiet", alias="TELEGRAM_NOTIFY")
     # Polymarket builder API creds (self-generated via L2 auth: clob.create_builder_api_key)
     # + relayer URL — needed to merge a V2 DepositWallet (sig_type 1/3), whose execute()
     # only accepts calls from its factory/relayer. See merge.py.
@@ -183,6 +190,11 @@ class Secrets(BaseSettings):
     @property
     def has_builder_creds(self) -> bool:
         return bool(self.builder_key and self.builder_secret and self.builder_passphrase)
+
+    @property
+    def has_telegram(self) -> bool:
+        """Presence check only — do not use this to print token/chat values."""
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
 
 
 class Config(BaseModel):

@@ -39,6 +39,12 @@ from polymaker.strategy.estimators import (
 )
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
+from polymaker.telegram_bot import (
+    TelegramBot,
+    TelegramSecrets,
+    parse_notify_mode,
+    schedule_notify,
+)
 from polymaker.userstream.client import UserStream
 
 log = get_logger("engine")
@@ -56,6 +62,7 @@ class Engine:
         self.risk = RiskManager(cfg.risk, self.state)
         self.merger = Merger(cfg)
         self.alerter = Alerter(cfg.secrets.alert_webhook_url, proxy=cfg.proxy)
+        self.telegram = self._make_telegram(cfg)
 
         self.md = MarketDataService(on_dirty=self._on_dirty, on_trade=self._on_trade,
                                     journal=self.journal, proxy=cfg.proxy)
@@ -84,6 +91,28 @@ class Engine:
         self._user_started = False  # user WS task launched (live mode)
         self._hb_was_down = False
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
+
+    @staticmethod
+    def _make_telegram(cfg: Config) -> TelegramBot:
+        """Build notifier from env-backed secrets. Never logs token/chat values."""
+        secrets: TelegramSecrets | None = None
+        if cfg.secrets.has_telegram:
+            secrets = TelegramSecrets(
+                token=cfg.secrets.telegram_bot_token or "",
+                chat_id=cfg.secrets.telegram_chat_id or "",
+                confirm=bool(cfg.secrets.telegram_confirm),
+                notify_mode=parse_notify_mode(cfg.secrets.telegram_notify),
+            )
+        bot = TelegramBot(secrets, proxy=cfg.proxy)
+        if bot.enabled:
+            log.info(
+                "telegram_enabled",
+                confirm=bot.confirm_enabled,
+                notify=bot.notify_mode,
+            )
+        else:
+            log.info("telegram_disabled")
+        return bot
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -123,6 +152,16 @@ class Engine:
         for cid in self.metas:
             self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
         self._spawn("supervisor", self._supervise)
+        # Telegram side-channel: command poll always; periodic push only if notify=all
+        self.telegram.bind(
+            status=self._telegram_status_text,
+            pnl=self._telegram_pnl_text,
+            on_stop=self._telegram_stop,
+        )
+        if self.telegram.enabled:
+            self._spawn("telegram", self.telegram.run_forever)
+            if self.telegram.push_periodic:
+                self._spawn("telegram_status", self.telegram.run_status_loop)
         self.risk.reset_day()
         log.info("engine_started", markets=len(self.metas))
 
@@ -156,6 +195,7 @@ class Engine:
     async def shutdown(self) -> None:
         self._running = False
         log.info("engine_shutdown")
+        self.telegram.stop()
         self.md.stop()
         if self.user:
             self.user.stop()
@@ -303,6 +343,15 @@ class Engine:
 
     def _on_fill(self, fill: Fill) -> None:
         self.risk.note_fill(fill)
+        schedule_notify(
+            self.telegram.notify_fill(
+                side=fill.side.value,
+                price=fill.price,
+                size=fill.size,
+                token_hint=fill.token_id[:12],
+                trade_id=fill.trade_id,
+            )
+        )
         cid = self._token_cid.get(fill.token_id)
         if cid is None:
             return
@@ -468,6 +517,9 @@ class Engine:
                 return
         placed_n = 0
         if plan.to_place:
+            if self.telegram.stop_requested:
+                log.warning("telegram_stop_skip_place", cid=cid[:8])
+                return
             # LOAD SHED: under rate-budget pressure, skip *new* quotes in calm
             # regimes (cancels/exits above already ran) so we don't inject latency
             # right when the book is busy. Risk regimes always place.
@@ -479,16 +531,39 @@ class Engine:
                 log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                 self._dirty[cid].set()  # retry soon
             else:
+                place_notional = sum(q.price * q.size for q in plan.to_place)
+                need, reason = self.telegram.needs_confirm(place_notional)
+                if need:
+                    ok = await self.telegram.request_confirm(
+                        reason,
+                        detail=f"{meta.question[:60]} | {len(plan.to_place)} quotes",
+                    )
+                    if not ok:
+                        log.warning("telegram_confirm_denied", cid=cid[:8], reason=reason)
+                        return
                 placed = await self.gateway.place(plan.to_place, meta)
                 placed_n = len(placed)
                 self.risk.note_order_result(len(placed) == len(plan.to_place))
                 for o in placed:
                     self.state.upsert_order(o)
+                if placed_n == 0 and plan.to_place:
+                    schedule_notify(
+                        self.telegram.notify_place_failed(n=len(plan.to_place))
+                    )
+                elif placed_n:
+                    self.telegram.note_placed(place_notional)
                 if len(placed) < len(plan.to_place):
                     # QUARANTINE: a failed/partial batch may still have posted
                     # orders we don't have ids for. Cancel everything on these
                     # tokens (idempotent) and resync — never risk an untracked order.
                     await self._quarantine(meta, reason="place_incomplete")
+                    if placed_n > 0:
+                        schedule_notify(
+                            self.telegram.notify_place_failed(
+                                n=len(plan.to_place) - placed_n,
+                                detail="partial batch → quarantine",
+                            )
+                        )
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),
@@ -714,6 +789,42 @@ class Engine:
                 for tok in (meta.yes.token_id, meta.no.token_id):
                     with contextlib.suppress(Exception):
                         await self._refresh_book(tok)
+
+    # ── Telegram status / control ───────────────────────────────────────
+    def _telegram_status_text(self) -> str:
+        snap = self.state.snapshot()
+        n_orders = snap.get("open_orders", 0)
+        positions = snap.get("positions") or {}
+        lines = [
+            f"markets={len(self.metas)} open_orders={n_orders}",
+            f"equity=${self.risk.equity:.4f} daily_pnl=${self.risk.daily_pnl:+.4f}",
+            f"stop_requested={self.telegram.stop_requested}",
+        ]
+        if not positions:
+            lines.append("positions: (none)")
+        else:
+            lines.append("positions:")
+            for tok, p in list(positions.items())[:8]:  # type: ignore[union-attr]
+                lines.append(f"  {tok[:12]}… size={p['size']:.2f} avg={p['avg_price']:.3f}")
+        return "\n".join(lines)
+
+    def _telegram_pnl_text(self) -> str:
+        return (
+            f"equity=${self.risk.equity:.4f}\n"
+            f"net_cash=${self.risk.net_cash:.4f}\n"
+            f"inventory=${self.risk.inventory_value:.4f}\n"
+            f"daily_pnl=${self.risk.daily_pnl:+.4f}"
+        )
+
+    async def _telegram_stop(self) -> None:
+        """/stop: cancel live quotes and halt new placements."""
+        self.telegram.stop_requested = True
+        log.critical("telegram_stop_requested")
+        with contextlib.suppress(Exception):
+            await self.gateway.cancel_all()
+        self.state.clear_orders()
+        self._wake_all()
+        schedule_notify(self.telegram.send("🛑 quotes cancelled; placements halted until restart"))
 
     async def _refresh_book(self, token_id: str) -> None:
         levels = await self.gateway.get_full_book(token_id)

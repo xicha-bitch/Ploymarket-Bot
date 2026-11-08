@@ -383,7 +383,7 @@ class ExecutionGateway:
             if isinstance(ba, dict) and k in ba:
                 try:
                     v = float(ba[k])
-                    return v / 1e6 if v > 1e6 else v
+                    return v / 1e6
                 except (ValueError, TypeError):
                     return 0.0
         return 0.0

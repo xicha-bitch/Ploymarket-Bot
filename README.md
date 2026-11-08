@@ -47,6 +47,8 @@ cp .env.example .env         # fill on YOUR machine only — never paste keys in
 
 - `PK` — signer private key (hot wallet holding only the trading bankroll)
 - `BROWSER_ADDRESS` — Polymarket deposit/funder address from the UI
+- Optional Telegram notify/confirm: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+  (see [TELEGRAM.md](TELEGRAM.md)) — never paste tokens into chat
 
 Everything else is TOML under [`config/`](config/):
 
@@ -79,6 +81,9 @@ uv run polymaker run --bankroll 25
 # ops
 uv run polymaker status
 uv run polymaker cancel-all
+
+# optional Telegram smoke (needs TELEGRAM_* in local .env)
+uv run polymaker telegram-smoke
 ```
 
 ## Architecture

@@ -6,3 +6,8 @@
 # slug    = "example-market-slug"
 # profile = "micro-capital"
 # enabled = true
+
+[[markets]]
+slug    = "us-announces-end-of-iranian-blockade-by-november-15-2026"
+profile = "micro-tight"
+enabled = true

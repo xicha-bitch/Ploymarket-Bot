@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 
 dependencies = [
-    "py-clob-client-v2==1.0.2",
+    "py-clob-client-v2>=1.2.1",
     "web3>=7.14",
     "httpx>=0.28",
     "websockets>=15.0",

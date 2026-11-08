@@ -8,7 +8,8 @@ tested.
 > [!IMPORTANT]
 > **Live-only micro-capital fork.** `polymaker run` places **real orders** with
 > small risk caps (~$25 exposure / ~$4 daily kill). No paper/sim/dry-run mode.
-> See [MICRO.md](MICRO.md). Upstream presets: `config-original/`.
+> Deploy steps: [DEPLOY.md](DEPLOY.md). Caps: [MICRO.md](MICRO.md).
+> Upstream presets: `config-original/`.
 
 > [!WARNING]
 > Market making on Polymarket is competitive and can lose money. This is a

@@ -11,6 +11,13 @@ TELEGRAM_CHAT_ID=
 TELEGRAM_CONFIRM=0
 ```
 
+**If a token was ever pasted into chat:** treat it as leaked. In
+[@BotFather](https://t.me/BotFather) → `/mybots` → your bot → API Token →
+**Revoke**, then put the **new** token only in local `.env` as
+`TELEGRAM_BOT_TOKEN=` (and `TELEGRAM_CHAT_ID=`). Never re-paste tokens into
+chat. Agents/docs will not save, echo, commit, or call Telegram with a
+chat-pasted token.
+
 1. Create a bot with [@BotFather](https://t.me/BotFather) → token → `TELEGRAM_BOT_TOKEN`
 2. Message the bot, then read `chat.id` from `getUpdates` → `TELEGRAM_CHAT_ID`
 3. Smoke: `uv run polymaker telegram-smoke` (sends `bot linked`; never prints the token)

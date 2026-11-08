@@ -1,0 +1,10 @@
+# Trade list (supervised MM session).
+[[markets]]
+slug    = "will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568"
+profile = "newsom-mm"
+enabled = true
+
+[[markets]]
+slug    = "will-alexandru-nazare-be-the-next-prime-minister-of-romania"
+profile = "romania-pm"
+enabled = true

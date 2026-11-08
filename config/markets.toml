@@ -1,0 +1,8 @@
+# Trade list — empty by default. After `polymaker scan`, add markets:
+#   polymaker markets-add <slug> --profile micro-capital
+#
+# Entries look like:
+# [[markets]]
+# slug    = "example-market-slug"
+# profile = "micro-capital"
+# enabled = true

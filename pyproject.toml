@@ -1,0 +1,78 @@
+[project]
+name = "polymaker"
+version = "2.2.0"
+description = "Live-only micro-capital fork of poly-maker: maker-only Polymarket CLOB V2 bot"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    "py-clob-client-v2==1.0.2",
+    "web3>=7.14",
+    "httpx>=0.28",
+    "websockets>=15.0",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "structlog>=25.1",
+    "typer>=0.15",
+    "rich>=14.0",
+    "watchfiles>=1.0",
+    "python-dotenv>=1.0",
+    "sortedcontainers>=2.4",
+    "uvloop>=0.21 ; sys_platform != 'win32'",
+    "socksio>=1.0",
+    "python-socks>=2.4",
+    "py-builder-relayer-client>=0.0.2",
+]
+
+[project.scripts]
+polymaker = "polymaker.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "respx>=0.22",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polymaker"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+ignore = [
+    "E501",     # line length handled by formatter
+    "UP042",    # str+Enum is intentional (JSON-serializable, API-string valued)
+    "ASYNC109", # timeout params on client wrappers are fine
+    "SIM108",   # ternary-vs-if is a readability call
+]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["polymaker"]
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
+# third-party libs without stubs
+[[tool.mypy.overrides]]
+module = ["py_clob_client_v2.*", "sortedcontainers.*", "web3.*", "eth_account.*", "py_builder_relayer_client.*", "py_builder_signing_sdk.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.uv]
+package = true

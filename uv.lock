@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1114,7 +1114,7 @@ wheels = [
 
 [[package]]
 name = "polymaker"
-version = "2.0.0"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -1149,7 +1149,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "py-builder-relayer-client", specifier = ">=0.0.2" },
-    { name = "py-clob-client-v2", specifier = "==1.0.2" },
+    { name = "py-clob-client-v2", specifier = ">=1.2.1" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
@@ -1297,7 +1297,7 @@ wheels = [
 
 [[package]]
 name = "py-clob-client-v2"
-version = "1.0.2"
+version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "eth-abi" },
@@ -1307,9 +1307,9 @@ dependencies = [
     { name = "poly-eip712-structs" },
     { name = "py-order-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/de/7d5c9e02988a221c44ab2d74b4bd682810e3e3f3a4856be7eef2bc874f6e/py_clob_client_v2-1.0.2.tar.gz", hash = "sha256:9c19a86a1ca67a995f3da4f2d95fd5d5e9e7e14777cb6fe4294b90040ccf67d0", size = 45727, upload-time = "2026-07-02T08:28:59.125Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/04/dc16a34571f5f2cafa8db7c27fbb1e030103f29c77ee5c7609fcc6725150/py_clob_client_v2-1.2.1.tar.gz", hash = "sha256:c405f6c57db8faf0dc81569ef4e8f7025f608c15b9cfa2ff202cf832bb0a59a9", size = 53302, upload-time = "2026-10-15T08:26:21.849Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/b9/2a72a6da948ab7df4b27335d515a1ebd061b8b1b855813af8c6202506b21/py_clob_client_v2-1.0.2-py3-none-any.whl", hash = "sha256:ca0b15016c3850ebafd702c0ffea134b4779878289590922a6ac43045cd3486a", size = 49168, upload-time = "2026-07-02T08:28:57.862Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/c7/c3fc6a54499f3dab7e1509e1a015922f422d3cb0b3e30658f314823ef69e/py_clob_client_v2-1.2.1-py3-none-any.whl", hash = "sha256:9dc00b444632cdb9aeae1c80490a3df0ff50dd5694a015480396cc4f77e7c6ae", size = 51828, upload-time = "2026-10-15T08:26:20.544Z" },
 ]
 
 [[package]]

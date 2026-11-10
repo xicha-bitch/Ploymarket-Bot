@@ -116,9 +116,25 @@ class StateStore:
         self.positions[token_id] = pos
         self._persist_position(pos)
 
-    def reconcile_positions(self, api_positions: dict[str, tuple[float, float]]) -> None:
+    def reconcile_positions(
+        self,
+        api_positions: dict[str, tuple[float, float]],
+        *,
+        is_snapshot: bool = True,
+    ) -> None:
         """Overwrite sizes from REST, skipping tokens with in-flight trades or
-        a very recent fill (the optimistic value is more current there)."""
+        a very recent fill (the optimistic value is more current there).
+
+        When ``is_snapshot`` is True, ``api_positions`` is a complete authoritative
+        snapshot: local tokens missing from it are zeroed (still respecting
+        in-flight and recent-fill guards). Incremental updates must pass
+        ``is_snapshot=False`` so absent tokens are left untouched. A failed
+        REST read must not call this with None or a fabricated empty dict.
+        """
+        if api_positions is None:
+            raise ValueError(
+                "api_positions must not be None (REST failure is not an empty snapshot)"
+            )
         now = time.time()
         for token_id, (size, avg) in api_positions.items():
             if self._inflight.get(token_id, 0) > 0:
@@ -126,6 +142,15 @@ class StateStore:
             if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
                 continue
             self.set_position(token_id, size, avg)
+
+        if is_snapshot:
+            for token_id, pos in list(self.positions.items()):
+                if pos.size > 0 and token_id not in api_positions:
+                    if self._inflight.get(token_id, 0) > 0:
+                        continue
+                    if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
+                        continue
+                    self.set_position(token_id, 0.0, 0.0)
 
     # ── in-flight guard ─────────────────────────────────────────────────
     def mark_inflight(self, token_id: str) -> None:

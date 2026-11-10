@@ -71,3 +71,25 @@ def test_pnl_hides_delta_when_no_fills() -> None:
     assert "暂不可用" in text
     assert "不是交易所账户总资产" in text
     assert "【账户总资产】" not in text
+
+
+def test_status_report_includes_protection_and_exit_channel_copy() -> None:
+    text = format_status_report(
+        markets=1,
+        open_orders=0,
+        balance_clob=0.5,
+        resting_buy=0.0,
+        position_mark=0.5,
+        fills=0,
+        session_equity=0.5,
+        session_daily_delta=0.0,
+        stop_requested=False,
+        positions={"yes-token": {"size": 10.0, "avg_price": 0.05}},
+        entry_blocked_infeasible=True,
+        one_sided_inventory=True,
+        exit_path_retained=True,
+    )
+    assert "不可行入场被阻止：是" in text
+    assert "单边库存：是" in text
+    assert "退出路径仍保留：是" in text
+    assert "【账户总资产】" not in text

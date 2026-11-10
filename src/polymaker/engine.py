@@ -20,7 +20,7 @@ from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
-from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side
+from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side, TargetQuotes
 from polymaker.execution.batch import chunk_quotes
 from polymaker.execution.gateway import ExecutionGateway, PositionsReadError
 from polymaker.execution.intent import (
@@ -109,6 +109,9 @@ class Engine:
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
         self._collateral_usdc: float | None = None
         self._collateral_ts: float = 0.0
+        self._restart_backoff_s: dict[str, float] = {}
+        self._last_budget_skip: dict[str, tuple[str, ...]] = {}
+        self._entry_blocked_infeasible: dict[str, bool] = {}
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -191,20 +194,38 @@ class Engine:
     _supervise_interval_s: float = 5.0
 
     async def _supervise(self) -> None:
-        """Restart any engine task that exits while we're running. Never down."""
+        """Restart any engine task that exits while we're running, with backoff."""
         while self._running:
             await asyncio.sleep(self._supervise_interval_s)
+            self._aux_tasks = [task for task in self._aux_tasks if not task.done()]
             for name, task in list(self._tasks.items()):
-                if name == "supervisor" or not task.done():
+                if name == "supervisor":
+                    continue
+                if not task.done():
+                    self._restart_backoff_s.pop(name, None)
                     continue
                 if not self._running:
                     return
+                delay = self._restart_backoff_s.get(name, 1.0)
                 exc = None
                 with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
                     exc = task.exception()
-                log.critical("task_died_restarting", task=name, err=str(exc) if exc else "exited")
-                self.alerter.alert("task_died", f"{name} died: {exc}", critical=True)
+                log.critical(
+                    "task_died_restarting",
+                    task=name,
+                    err=str(exc) if exc else "exited",
+                    backoff_s=delay,
+                )
+                self.alerter.alert(
+                    "task_died",
+                    f"{name} died: {exc}",
+                    critical=delay <= 1.0,
+                )
+                await asyncio.sleep(delay)
+                if not self._running:
+                    return
                 self._tasks[name] = asyncio.create_task(self._task_specs[name](), name=name)
+                self._restart_backoff_s[name] = min(max(delay, 1.0) * 2.0, 60.0)
 
     async def run_forever(self) -> None:
         await self.start()
@@ -277,25 +298,58 @@ class Engine:
         )
 
     async def _startup_reconcile(self) -> None:
-        with contextlib.suppress(Exception):
-            await self.gateway.cancel_all()  # clean slate; heartbeat covers crashes
-        # cancel-all may have partially failed — verify no orders remain, and
-        # cancel/adopt any stragglers so we never quote on top of an unknown order
-        with contextlib.suppress(Exception):
+        """Adopt a known order+position view or fail closed before quoting."""
+        try:
+            await self.gateway.cancel_all()
+        except Exception as exc:  # noqa: BLE001
+            log.error("startup_cancel_all_failed", err=str(exc)[:200])
+            self.alerter.alert(
+                "startup_cancel_all_failed",
+                f"cancel-all failed; verifying open orders before quoting: {exc}",
+                critical=True,
+            )
+
+        try:
             leftover = await self.gateway.open_orders()
-            if leftover:
-                log.warning("startup_orders_remain", n=len(leftover))
+        except Exception as exc:  # noqa: BLE001
+            log.error("startup_open_orders_failed", err=str(exc)[:200])
+            self.alerter.alert(
+                "startup_open_orders_failed",
+                f"cannot verify open orders at startup: {exc}",
+                critical=True,
+            )
+            raise RuntimeError("startup_open_orders_failed") from exc
+
+        if leftover:
+            log.warning("startup_orders_remain", n=len(leftover))
+            try:
                 for tok in {o.token_id for o in leftover}:
                     await self.gateway.cancel_asset(tok)
                 still = await self.gateway.open_orders()
-                for tok in self._token_cid:
-                    self.state.replace_open_orders(
-                        tok, [o for o in still if o.token_id == tok], grace_s=0.0
-                    )
-                if still:
-                    log.error("startup_orders_stuck", n=len(still))
-                    self.alerter.alert("startup_orders_stuck",
-                                       f"{len(still)} orders survived cancel-all", critical=True)
+            except Exception as exc:  # noqa: BLE001
+                log.error("startup_orders_unverified", err=str(exc)[:200])
+                self.alerter.alert(
+                    "startup_orders_unverified",
+                    f"could not finish cancelling leftover startup orders: {exc}",
+                    critical=True,
+                )
+                raise RuntimeError("startup_orders_unverified") from exc
+            for tok in self._token_cid:
+                self.state.replace_open_orders(
+                    tok, [o for o in still if o.token_id == tok], grace_s=0.0
+                )
+            if still:
+                log.error("startup_orders_stuck", n=len(still))
+                self.alerter.alert(
+                    "startup_orders_stuck",
+                    f"{len(still)} orders survived cancel-all",
+                    critical=True,
+                )
+                raise RuntimeError("startup_orders_stuck")
+        else:
+            for tok in self._token_cid:
+                self.state.replace_open_orders(tok, [], grace_s=0.0)
+
         # purge positions that leaked in for markets we don't trade (manual UI
         # bets etc.) so they can't distort exposure caps or PnL
         self.state.drop_untracked_positions(set(self._token_cid))
@@ -310,11 +364,9 @@ class Engine:
                 critical=True,
             )
             raise
-        if positions:
-            self.state.reconcile_positions(positions)
-            log.info("startup_positions", n=len(positions))
-        else:
-            log.info("startup_positions", n=0)
+        # Empty dict is a valid complete snapshot and must zero stale locals.
+        self.state.reconcile_positions(positions, is_snapshot=True)
+        log.info("startup_positions", n=len(positions))
 
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
@@ -462,7 +514,37 @@ class Engine:
         p = self.profiles[cid]
         yes_book = self.md.book(meta.yes.token_id)
         no_book = self.md.book(meta.no.token_id)
-        if yes_book is None or yes_book.is_empty:
+        books_usable = (
+            yes_book is not None
+            and not yes_book.is_empty
+            and self.md.is_fresh(meta.yes.token_id)
+            and self.md.is_fresh(meta.no.token_id)
+        )
+        if not books_usable:
+            # Don't price new quotes off missing/cleared books. If the link is
+            # down or we are waiting for a post-reconnect snapshot, pull any
+            # existing quotes so we don't leave stale orders working.
+            link_down = (not self.md.connected and self.md.disconnected_since > 0.0)
+            waiting = (
+                self.md.needs_snapshot(meta.yes.token_id)
+                or self.md.needs_snapshot(meta.no.token_id)
+            )
+            if link_down or waiting:
+                live = (
+                    self.state.orders_for(meta.yes.token_id)
+                    + self.state.orders_for(meta.no.token_id)
+                )
+                if live:
+                    tq = TargetQuotes(cid, Regime.HALTED, ())
+                    plan = reconcile(
+                        tq, live, tick=meta.tick_size,
+                        reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac,
+                    )
+                    if plan.to_cancel:
+                        ok = await self.gateway.cancel(plan.to_cancel)
+                        if ok:
+                            for oid in plan.to_cancel:
+                                self.state.remove_order(oid)
             return
 
         # crossed/locked or one-sided book -> FV is unreliable; skip this tick
@@ -554,6 +636,13 @@ class Engine:
         adv_scale = self.risk.advisory_size_scale(meta)
         size_scale = min(rd.size_scale, adv_scale) if adv_scale < 1.0 else rd.size_scale
 
+        headroom = self._current_headroom(meta)
+        expensive = max(fv, 1.0 - fv)
+        self._entry_blocked_infeasible[cid] = bool(
+            headroom is not None
+            and meta.min_order_size > 0
+            and expensive * meta.min_order_size > headroom + 1e-9
+        )
         tq = construct_quotes(QuoteInputs(
             meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
             toxicity=est.markout.toxicity, yes_view=yes_book.view(),
@@ -561,6 +650,7 @@ class Engine:
             pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
             risk_size_scale=size_scale,
             yes_exit_urgency=yes_u, no_exit_urgency=no_u,
+            headroom_usdc=headroom,
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
@@ -623,7 +713,12 @@ class Engine:
                                 "telegram_confirm_denied", cid=cid[:8], reason=reason
                             )
                             return
-                    placed = await self._place_with_intent(cid, meta, to_place)
+                    try:
+                        placed = await self._place_with_intent(cid, meta, to_place)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("place_intent_failed", cid=cid[:8], err=str(exc)[:200])
+                        await self._quarantine(meta, reason="place_exception")
+                        placed = []
                     placed_n = len(placed)
                     self.risk.note_order_result(len(placed) == len(to_place))
                     for o in placed:
@@ -704,9 +799,12 @@ class Engine:
             fee_buffer_usdc=_FEE_BUFFER_USDC,
         )
         decision = filter_quotes_to_budget(quotes, headroom_usdc=headroom)
-        for msg in decision.skipped:
-            log.warning("budget_reject", cid=cid[:8], detail=msg)
-        if decision.skipped:
+        skipped = tuple(decision.skipped)
+        if any("reason=infeasible" in msg for msg in skipped):
+            self._entry_blocked_infeasible[cid] = True
+        if skipped and skipped != self._last_budget_skip.get(cid):
+            for msg in skipped:
+                log.warning("budget_reject", cid=cid[:8], detail=msg)
             log.info(
                 "budget_filter",
                 cid=cid[:8],
@@ -716,7 +814,25 @@ class Engine:
                 kept=len(decision.kept),
                 skipped=len(decision.skipped),
             )
+            self._last_budget_skip[cid] = skipped
+        elif not skipped:
+            self._last_budget_skip.pop(cid, None)
         return list(decision.kept)
+
+    def _current_headroom(self, meta: MarketMeta) -> float | None:
+        """Best-effort place headroom from the last collateral snapshot (no I/O)."""
+        available = self._collateral_usdc
+        if available is None:
+            return None
+        return place_headroom_usdc(
+            available_usdc=available,
+            resting_buy_usdc=self.risk.resting_buy_notional(meta),
+            filled_market_usdc=self.risk.filled_market_notional(meta),
+            filled_total_usdc=self.risk.filled_total_exposure(),
+            max_market_notional_usdc=self.cfg.risk.max_market_notional_usdc,
+            max_total_exposure_usdc=self.cfg.risk.max_total_exposure_usdc,
+            fee_buffer_usdc=_FEE_BUFFER_USDC,
+        )
 
     async def _place_with_intent(
         self, cid: str, meta: MarketMeta, quotes: list[Quote]
@@ -843,8 +959,9 @@ class Engine:
                     # Keep prior local inventory; never interpret failed read as flat.
                     log.warning("reconcile_positions_failed", err=str(exc))
                     positions = None
-                if positions:
-                    self.state.reconcile_positions(positions)
+                if positions is not None:
+                    # Empty dict is a valid complete snapshot and must zero stale locals.
+                    self.state.reconcile_positions(positions, is_snapshot=True)
                 live = await self.gateway.open_orders()
                 by_token: dict[str, list[Any]] = {}
                 for o in live:
@@ -1006,6 +1123,20 @@ class Engine:
         if not isinstance(positions, dict):
             positions = {}
 
+        blocked = any(self._entry_blocked_infeasible.values()) if self._entry_blocked_infeasible else None
+        one_sided = False
+        held_sides = 0
+        for meta in self.metas.values():
+            yes_held = self.state.position(meta.yes.token_id).size >= meta.min_order_size
+            no_held = self.state.position(meta.no.token_id).size >= meta.min_order_size
+            if yes_held:
+                held_sides += 1
+            if no_held:
+                held_sides += 1
+        if held_sides == 1:
+            one_sided = True
+        elif held_sides == 0:
+            one_sided = False
         return format_status_report(
             markets=len(self.metas),
             open_orders=n_orders,
@@ -1017,6 +1148,9 @@ class Engine:
             session_daily_delta=self.risk.daily_pnl,
             stop_requested=self.telegram.stop_requested,
             positions=positions,
+            entry_blocked_infeasible=blocked,
+            one_sided_inventory=one_sided,
+            exit_path_retained=True,
         )
 
     def _telegram_pnl_text(self) -> str:
@@ -1061,6 +1195,7 @@ class Engine:
         if drift:
             log.warning("book_drift_corrected", token=token_id[:12])
             book.apply_snapshot(bids, asks, time.time(), book_hash)
+            self.md.ack_snapshot(token_id)
             cid = self._token_cid.get(token_id)
             if cid:
                 self._wake_cid(cid)

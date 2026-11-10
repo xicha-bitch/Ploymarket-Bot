@@ -108,3 +108,72 @@ def test_service_forwards_trades_for_flow():
     svc.set_markets([("0xcond", ["yes-tok"])])
     svc._dispatch(LAST_TRADE)
     assert len(trades) == 1 and trades[0].aggressor is Side.BUY
+
+
+
+def test_disconnect_clears_books_and_marks_stale():
+    woken: list[tuple[str, str]] = []
+    svc = MarketDataService(on_dirty=lambda c, t: woken.append((c, t)))
+    svc.set_markets([("0xcond", ["yes-tok"])])
+    svc._dispatch(BOOK)
+    svc.connected = True
+
+    assert svc.is_fresh("yes-tok")
+    assert not svc.is_stale("yes-tok")
+    assert not svc.needs_snapshot("yes-tok")
+    assert svc.book("yes-tok").best_bid().price == 0.49
+
+    woken.clear()
+    svc.on_disconnect()
+
+    assert not svc.connected
+    assert not svc.is_fresh("yes-tok")
+    assert svc.is_stale("yes-tok")
+    assert svc.needs_snapshot("yes-tok")
+    assert svc.book("yes-tok").best_bid() is None
+    assert svc.view("yes-tok").best_bid is None
+    assert ("0xcond", "yes-tok") in woken
+
+
+def test_reconnect_remains_stale_until_fresh_snapshot():
+    svc = MarketDataService()
+    svc.set_markets([("0xcond", ["yes-tok"])])
+    svc._dispatch(BOOK)
+    svc.connected = True
+    svc.on_disconnect()
+
+    # Reconnection succeeds, but new snapshot has not yet arrived
+    svc.connected = True
+    assert not svc.is_fresh("yes-tok")
+    assert svc.is_stale("yes-tok")
+    assert svc.needs_snapshot("yes-tok")
+    assert svc.book("yes-tok").best_bid() is None
+
+    svc._dispatch(BOOK)
+    assert svc.is_fresh("yes-tok")
+    assert not svc.is_stale("yes-tok")
+    assert not svc.needs_snapshot("yes-tok")
+    assert svc.book("yes-tok").best_bid().price == 0.49
+
+
+def test_quiet_market_with_live_connection_is_fresh():
+    svc = MarketDataService()
+    svc.set_markets([("0xcond", ["yes-tok"])])
+    svc.connected = True
+    svc._dispatch(BOOK)
+    assert svc.is_fresh("yes-tok")
+    assert not svc.is_stale("yes-tok")
+
+
+def test_needs_snapshot_blocks_freshness_even_with_leftover_depth():
+    svc = MarketDataService()
+    svc.set_markets([("0xcond", ["yes-tok"])])
+    svc._dispatch(BOOK)
+    svc.connected = True
+    assert svc.is_fresh("yes-tok")
+    svc._needs_snapshot.add("yes-tok")
+    assert not svc.is_fresh("yes-tok")
+    assert svc.is_stale("yes-tok")
+    assert svc.needs_snapshot("yes-tok")
+    # leftover depth must not be treated as a post-reconnect snapshot
+    assert svc.book("yes-tok").best_bid() is not None

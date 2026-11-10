@@ -68,3 +68,6 @@ class StubGateway:
 
     async def token_balances(self, token_ids: list[str]) -> dict[str, float]:
         return {t: 0.0 for t in token_ids}
+
+    async def positions(self) -> dict[str, tuple[float, float]]:
+        return {}

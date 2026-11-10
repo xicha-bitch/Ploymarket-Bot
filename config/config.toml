@@ -1,5 +1,6 @@
 # polymaker MICRO-CAPITAL defaults (~USD 20–30 bankroll).
 # Secrets live in .env only. Original upstream presets: config-original/
+# The current small-capital live operator caps live in config/live-micro/ (intentional; do not enlarge).
 
 [wallet]
 chain_id = 137

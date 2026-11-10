@@ -34,6 +34,9 @@ def format_status_report(
     session_daily_delta: float | None,
     stop_requested: bool,
     positions: dict[str, Any] | None,
+    entry_blocked_infeasible: bool | None = None,
+    one_sided_inventory: bool | None = None,
+    exit_path_retained: bool | None = None,
 ) -> str:
     """Build Chinese /status body with real newlines and clear 口径 labels."""
     lines = [
@@ -84,6 +87,23 @@ def format_status_report(
             size_s = f"{float(size):.4f} 份" if size is not None else "未知/读取失败"
             avg_s = f"{float(avg):.4f} pUSD/份" if avg is not None else "未知/读取失败"
             lines.append(f"· {str(tok)[:12]}… 数量={size_s} 均价={avg_s}")
+    if one_sided_inventory is None and positions:
+        held = [
+            tok
+            for tok, pos in positions.items()
+            if float((pos or {}).get("size") or 0.0) > 0
+        ]
+        one_sided_inventory = len(held) == 1
+    lines.extend(
+        [
+            "",
+            "【做市防护与可行性】",
+            f"· 不可行入场被阻止：{fmt_bool_zh(entry_blocked_infeasible) if entry_blocked_infeasible is not None else '未知/未提供'}（最小下单名义超过可用预算时跳过新买单，避免反复拒单刷屏）",
+            f"· 单边库存：{fmt_bool_zh(one_sided_inventory) if one_sided_inventory is not None else '未知/未提供'}"
+            + ("（仅持有单侧代币）" if one_sided_inventory else ""),
+            f"· 退出路径仍保留：{fmt_bool_zh(True if exit_path_retained is None else exit_path_retained)}（已有持仓继续挂被动卖单，不主动吃单，也不会为切换市场而自动卖光）",
+        ]
+    )
     return "\n".join(lines)
 
 

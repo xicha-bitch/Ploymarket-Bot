@@ -138,3 +138,20 @@ def apply_min_size_clamp(
         return round(hard, 2) if hard > 0 else 0.0
     tapered = size_shares * scale
     return round(max(tapered, hard), 2)
+
+
+def is_min_size_feasible(
+    price: float,
+    *,
+    min_order_size: float,
+    headroom_usdc: float | None,
+) -> bool:
+    """Check if min_order_size @ price is affordable within available headroom.
+
+    If headroom_usdc is None, returns True.
+    """
+    if headroom_usdc is None:
+        return True
+    if price <= 0 or min_order_size <= 0:
+        return True
+    return (price * min_order_size) <= headroom_usdc + _EPS

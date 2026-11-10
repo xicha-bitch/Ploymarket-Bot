@@ -52,6 +52,8 @@ async def test_crossed_book_skips_quoting(tmp_path, meta):
     # crossed: best bid (0.55) above best ask (0.45)
     eng.md.book(meta.yes.token_id).apply_snapshot(bids=[(0.55, 100)], asks=[(0.45, 100)], ts=now)
     eng.md.book(meta.no.token_id).apply_snapshot(bids=[(0.45, 100)], asks=[(0.55, 100)], ts=now)
+    eng.md.ack_snapshot(meta.yes.token_id)
+    eng.md.ack_snapshot(meta.no.token_id)
     await eng._recompute(meta.condition_id)
     assert eng.state.orders == {}  # no quotes on a nonsensical book
     eng.state.close()

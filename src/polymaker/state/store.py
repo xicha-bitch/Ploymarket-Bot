@@ -262,6 +262,11 @@ class StateStore:
             "open_orders": len(self.orders),
         }
 
+    def fill_count(self) -> int:
+        """Total fills recorded in SQLite (deduped by trade_id)."""
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM fills").fetchone()
+        return int(row["n"]) if row is not None else 0
+
 
 def _pos_json(p: Position) -> str:
     return json.dumps({"size": round(p.size, 4), "avg_price": round(p.avg_price, 4)})

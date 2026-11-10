@@ -11,7 +11,7 @@
   polymaker livetest             tiny live place+cancel (requires LIVE_ENABLE=1)
   polymaker moneydoctor          tiny live spend self-test (requires LIVE_ENABLE=1)
   polymaker cancel-all           panic cancel (wallet only; LIVE_ENABLE not required)
-  polymaker telegram-smoke       send 'bot linked' if TELEGRAM_* set (private chat only)
+  polymaker telegram-smoke       send Chinese link-ok if TELEGRAM_* set (private chat only)
 """
 
 from __future__ import annotations
@@ -339,7 +339,7 @@ def moneydoctor(
 
 @app.command(name="telegram-smoke")
 def telegram_smoke() -> None:
-    """Send a one-line 'bot linked' message if TELEGRAM_* env keys are set.
+    """Send a one-line Chinese link-ok message if TELEGRAM_* env keys are set.
 
     Never prints token or chat id — only whether the send succeeded.
     Requires the configured chat to be a private user chat.
@@ -357,7 +357,7 @@ def telegram_smoke() -> None:
         raise typer.Exit(1)
     ok = asyncio.run(TelegramBot().smoke_send())
     if ok:
-        console.print("[green]Smoke OK — check Telegram for 'bot linked'.[/green]")
+        console.print("[green]Smoke OK — check Telegram for「机器人已连通」.[/green]")
     else:
         console.print(
             "[red]Smoke send failed[/red] "

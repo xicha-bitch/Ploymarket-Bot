@@ -55,12 +55,12 @@ def test_needs_confirm_first_day_and_size_bump() -> None:
     bot = TelegramBot(secrets)
     need, reason = bot.needs_confirm(5.0)
     assert need is True
-    assert "first place" in reason
+    assert "首次下单" in reason
     bot.note_placed(5.0)
     assert bot.needs_confirm(5.5) == (False, "")
     need2, reason2 = bot.needs_confirm(8.0)  # >25% and +$1
     assert need2 is True
-    assert "size increase" in reason2
+    assert "名义放大" in reason2
 
 
 def test_confirm_disabled_passes_silently() -> None:
@@ -211,14 +211,14 @@ def test_handle_chat_replies_chinese() -> None:
 
     replies = asyncio.run(_go())
     assert len(replies) == 7
-    assert "交易通知 bot" in replies[0]
+    assert "交易通知机器人" in replies[0]
     assert "/status" in replies[0]
-    assert "交易通知 bot" in replies[1]
-    assert "交易通知 bot" in replies[2]
-    assert "交易通知 bot" in replies[3]
+    assert "交易通知机器人" in replies[1]
+    assert "交易通知机器人" in replies[2]
+    assert "交易通知机器人" in replies[3]
     assert "不会查天气" in replies[4]
     assert "/help" in replies[5]
-    assert "交易通知 bot" in replies[6]
+    assert "交易通知机器人" in replies[6]
 
 
 @respx.mock

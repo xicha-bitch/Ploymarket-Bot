@@ -53,6 +53,7 @@ from polymaker.telegram_bot import (
     parse_notify_mode,
     schedule_notify,
 )
+from polymaker.telegram_copy import format_pnl_report, format_status_report
 from polymaker.userstream.client import UserStream
 
 log = get_logger("engine")
@@ -977,10 +978,9 @@ class Engine:
 
     # ── Telegram status / control (report side-channel) ─────────────────
     async def _telegram_status_text(self) -> str:
-        """Separate balance / resting / position mark / fills / PnL. Fail ≠ 0."""
+        """Chinese status: separate balance/resting/mark/fills/session ledger."""
         await self._refresh_collateral(force=False)
         bal = self._collateral_usdc
-        bal_s = f"${bal:.6f}" if bal is not None else "unknown"
 
         resting = 0.0
         n_orders = 0
@@ -994,40 +994,43 @@ class Engine:
             mark = await self.gateway.portfolio_value()
         except Exception:  # noqa: BLE001
             mark = None
-        mark_s = f"${mark:.4f}" if mark is not None else "unknown"
 
+        fills: int | None
         try:
-            fills_s = str(self.state.fill_count())
+            fills = self.state.fill_count()
         except Exception:  # noqa: BLE001
-            fills_s = "unknown"
+            fills = None
 
         snap = self.state.snapshot()
         positions = snap.get("positions") or {}
-        lines = [
-            f"markets={len(self.metas)} open_orders={n_orders}",
-            f"balance(clob)={bal_s}",
-            f"resting_buy=${resting:.6f}",
-            f"position_mark={mark_s}",
-            f"fills={fills_s}",
-            f"equity=${self.risk.equity:.4f} daily_pnl=${self.risk.daily_pnl:+.4f}",
-            f"stop_requested={self.telegram.stop_requested}",
-        ]
-        if not positions:
-            lines.append("positions: (none tracked)")
-        else:
-            lines.append("positions:")
-            for tok, p in list(positions.items())[:8]:  # type: ignore[union-attr]
-                lines.append(
-                    f"  {tok[:12]}… size={p['size']:.2f} avg={p['avg_price']:.3f}"
-                )
-        return "\n".join(lines)
+        if not isinstance(positions, dict):
+            positions = {}
+
+        return format_status_report(
+            markets=len(self.metas),
+            open_orders=n_orders,
+            balance_clob=bal,
+            resting_buy=resting,
+            position_mark=mark,
+            fills=fills,
+            session_equity=self.risk.equity,
+            session_daily_delta=self.risk.daily_pnl,
+            stop_requested=self.telegram.stop_requested,
+            positions=positions,
+        )
 
     def _telegram_pnl_text(self) -> str:
-        return (
-            f"equity=${self.risk.equity:.4f}\n"
-            f"net_cash=${self.risk.net_cash:.4f}\n"
-            f"inventory=${self.risk.inventory_value:.4f}\n"
-            f"daily_pnl=${self.risk.daily_pnl:+.4f}"
+        fills: int | None
+        try:
+            fills = self.state.fill_count()
+        except Exception:  # noqa: BLE001
+            fills = None
+        return format_pnl_report(
+            session_equity=self.risk.equity,
+            net_cash=self.risk.net_cash,
+            inventory=self.risk.inventory_value,
+            session_daily_delta=self.risk.daily_pnl,
+            fills=fills,
         )
 
     async def _telegram_stop(self) -> None:

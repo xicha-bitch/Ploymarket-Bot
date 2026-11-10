@@ -5,7 +5,8 @@ pUSD balance adjustment, and tick/fee caching) and offloads its blocking network
 calls to a thread pool so the asyncio hot path never stalls. Every quote goes out
 **post-only** (the maker-only mandate, enforced at the exchange).
 
-Live-only: every place/cancel/heartbeat hits the real CLOB (requires wallet secrets).
+Live-only product: place/market-order require LIVE_ENABLE=1 + wallet. Connect and
+cancel paths need wallet only so emergency cancel still works when places are gated.
 """
 
 from __future__ import annotations
@@ -131,9 +132,19 @@ class ExecutionGateway:
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("clock_check_failed", err=str(exc))
 
+    def _assert_place_gate(self) -> None:
+        """Fail closed: CLOB place/market-order unreachable without LIVE_ENABLE=1."""
+        from polymaker.live_gate import assert_live_place_allowed
+
+        assert_live_place_allowed(self._cfg)
+
     # ── placement ───────────────────────────────────────────────────────
     async def place(self, quotes: list[Quote], meta: MarketMeta) -> list[OpenOrder]:
         if not quotes:
+            return []
+        self._assert_place_gate()
+        if self._client is None:
+            log.error("place_failed", err="not connected", n=len(quotes))
             return []
         await self._order_bucket.acquire(len(quotes))
         ts = time.time()
@@ -230,6 +241,12 @@ class ExecutionGateway:
         This is a TAKER order (crosses the spread) — only the moneydoctor live
         self-test uses it; the maker strategy never does.
         """
+        from polymaker.live_gate import LiveGateError
+
+        try:
+            self._assert_place_gate()
+        except LiveGateError as exc:
+            return {"status": "failed", "error": str(exc)}
         if self._client is None:
             return {"status": "failed", "error": "not connected"}
 

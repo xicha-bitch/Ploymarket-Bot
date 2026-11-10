@@ -47,8 +47,12 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
         console.print(f"  {mark} {label}" + (f"  [dim]{detail}[/dim]" if detail else ""))
         ok = ok and passed
 
-    if not cfg.secrets.has_wallet:
-        console.print("[red]No wallet in .env.[/red]")
+    from polymaker.live_gate import LiveGateError, assert_live_place_allowed
+
+    try:
+        assert_live_place_allowed(cfg)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
         return False
 
     console.print("[bold]polymaker moneydoctor[/bold]  [dim](spends a little real money)[/dim]")

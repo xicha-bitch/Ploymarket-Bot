@@ -7,8 +7,11 @@ tested.
 
 > [!IMPORTANT]
 > **Live-only micro-capital fork.** `polymaker run` places **real orders** with
-> small risk caps (~$25 exposure / ~$4 daily kill). No paper/sim/dry-run mode.
-> See [MICRO.md](MICRO.md). Upstream presets: `config-original/`.
+> small risk caps (~$25 exposure / ~$4 daily kill). There is **no**
+> paper/sim/dry-run product mode. Stubs under `tests/` are engineering
+> verification only. Live place/start requires explicit `LIVE_ENABLE=1` plus
+> wallet secrets and a passing capital-check. See [MICRO.md](MICRO.md).
+> Upstream presets: `config-original/`.
 
 > [!WARNING]
 > Market making on Polymarket is competitive and can lose money. This is a
@@ -27,6 +30,8 @@ tested.
 - Reconciles a target quote set against live orders with churn tolerances; runs
   the exchange **heartbeat** dead-man switch; enforces risk caps and a daily-loss
   kill switch.
+- **Fail-closed live gate**: `LIVE_ENABLE=1` required for place / `run` /
+  `livetest` / `moneydoctor`. Emergency `cancel-all` works with wallet alone.
 - Config, market selection, and state are **local files + SQLite**. An operator
   with the repo, a `.env`, and a funded wallet is a complete deployment.
 
@@ -45,6 +50,7 @@ uv run polymaker --help
 cp .env.example .env         # fill on YOUR machine only — never paste keys into chat
 ```
 
+- `LIVE_ENABLE=1` — explicit live place/start authorization (leave unset until ready)
 - `PK` — signer private key (hot wallet holding only the trading bankroll)
 - `BROWSER_ADDRESS` — Polymarket deposit/funder address from the UI
 
@@ -57,11 +63,11 @@ Everything else is TOML under [`config/`](config/):
 ## Use (live micro-capital)
 
 ```bash
-# 0. bankroll + fee sanity
+# 0. bankroll + fee sanity (no LIVE_ENABLE needed)
 uv run polymaker capital-check --bankroll 25
 uv run polymaker fee-estimate --shares 5 --price 0.5 --category crypto
 
-# 1. wallet preflight (needs local .env)
+# 1. wallet preflight (needs local .env; does not place)
 uv run polymaker doctor
 
 # 2. discover + rank markets
@@ -71,14 +77,14 @@ uv run polymaker markets
 # 3. add a market with micro profile
 uv run polymaker markets-add <slug> --profile micro-capital
 
-# 4. LIVE run — real orders, micro caps enforced
+# 4. LIVE run — set LIVE_ENABLE=1 in .env first; real orders, micro caps
 uv run polymaker run --bankroll 25
 
-# optional tiny live checks: livetest / moneydoctor
+# optional tiny live checks (also need LIVE_ENABLE=1): livetest / moneydoctor
 
 # ops
 uv run polymaker status
-uv run polymaker cancel-all
+uv run polymaker cancel-all   # panic — wallet only; works if LIVE_ENABLE is off
 ```
 
 ## Architecture
@@ -136,11 +142,12 @@ uv run mypy src               # types (strict)
 
 ## Status
 
-Implemented and live-verified end to end (auth → book → strategy → sign → post →
-cancel): config, catalog/scanner, order book + analytics, strategy (FV,
-vol/toxicity, regime, quoting), state store + lifecycle, execution gateway +
-reconciler + heartbeat, market/user websockets, risk manager, merger (EOA path),
-engine, CLI, journal capture. Live-only micro-capital fork; ruff + mypy strict clean.
+Implemented end to end (auth → book → strategy → sign → post → cancel): config,
+catalog/scanner, order book + analytics, strategy (FV, vol/toxicity, regime,
+quoting), state store + lifecycle, execution gateway + reconciler + heartbeat,
+market/user websockets, risk manager, merger (EOA path), engine, CLI, journal
+capture, **LIVE_ENABLE fail-closed place gate**, credential log redaction.
+Live-only micro-capital fork; ruff + mypy strict clean.
 
 Not yet built: a replay backtester over the captured journals, and external data
 feeds (polls / news / cross-venue). Merging through a Safe/proxy wallet routes a

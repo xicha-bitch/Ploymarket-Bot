@@ -9,6 +9,38 @@ from typing import Any
 
 import structlog
 
+# Event-dict keys that must never appear in logs (credential redaction).
+_REDACT_KEYS_LOWER = frozenset(
+    {
+        "pk",
+        "private_key",
+        "privatekey",
+        "secret",
+        "api_key",
+        "api_secret",
+        "apikey",
+        "apisecret",
+        "passphrase",
+        "builder_key",
+        "builder_secret",
+        "builder_passphrase",
+        "poly_builder_key",
+        "poly_builder_secret",
+        "poly_builder_passphrase",
+        "authorization",
+    }
+)
+
+
+def redact_secrets(
+    _logger: Any, _method_name: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace known secret field values with ``***`` before render."""
+    for key in list(event_dict):
+        if key.lower() in _REDACT_KEYS_LOWER:
+            event_dict[key] = "***"
+    return event_dict
+
 
 def configure(
     *,
@@ -19,6 +51,7 @@ def configure(
     """Set up structlog + stdlib logging once at process start."""
     shared: list[Any] = [
         structlog.contextvars.merge_contextvars,
+        redact_secrets,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),

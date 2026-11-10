@@ -5,10 +5,12 @@
   polymaker markets-add <slug>   append a market to config/markets.toml
   polymaker status               positions / open orders / PnL (reads SQLite)
   polymaker doctor               preflight: wallet auth, balances, WS reachability
-  polymaker run                  start LIVE MM (micro risk caps)
+  polymaker run                  start LIVE MM (requires LIVE_ENABLE=1)
   polymaker capital-check        verify risk caps vs bankroll
   polymaker fee-estimate         estimate taker fees for a hypothetical fill
-  polymaker cancel-all           panic button
+  polymaker livetest             tiny live place+cancel (requires LIVE_ENABLE=1)
+  polymaker moneydoctor          tiny live spend self-test (requires LIVE_ENABLE=1)
+  polymaker cancel-all           panic cancel (wallet only; LIVE_ENABLE not required)
 """
 
 from __future__ import annotations
@@ -125,15 +127,15 @@ def status(config_dir: str = typer.Option("config", help="config directory")) ->
     store = StateStore(cfg.paths.db)
     snap = store.snapshot()
     console.print(f"[bold]Open orders:[/bold] {snap['open_orders']}")
-    positions = snap["positions"]  # type: ignore[assignment]
-    if not positions:
+    positions = snap["positions"]
+    if not isinstance(positions, dict) or not positions:
         console.print("[dim]No open positions.[/dim]")
     else:
         table = Table(title="Positions")
         table.add_column("token")
         table.add_column("size", justify="right")
         table.add_column("avg", justify="right")
-        for tok, p in positions.items():  # type: ignore[union-attr]
+        for tok, p in positions.items():
             table.add_row(tok[:16] + "…", f"{p['size']:.2f}", f"{p['avg_price']:.3f}")
         console.print(table)
     store.close()
@@ -185,10 +187,15 @@ def export_csv(
 
 @app.command()
 def doctor(config_dir: str = typer.Option("config", help="config directory")) -> None:
-    """Preflight: wallet auth, balances, WS reachability."""
+    """Preflight: wallet auth, balances, WS reachability (does not place orders)."""
     from polymaker.doctor import run_doctor
+    from polymaker.live_gate import is_live_enabled
 
     cfg = Config.load(config_dir)
+    if not is_live_enabled(cfg.secrets):
+        console.print(
+            "[dim]LIVE_ENABLE is not 1 — doctor may auth, but place/run stay gated.[/dim]"
+        )
     ok = asyncio.run(run_doctor(cfg, console))
     raise typer.Exit(0 if ok else 1)
 
@@ -201,32 +208,23 @@ def run(
         help="bankroll USDC/pUSD for preflight capital-check before live start",
     ),
 ) -> None:
-    """Start the live market maker with micro-capital risk caps."""
-    from polymaker.capital import assess_capital
+    """Start the live market maker (requires LIVE_ENABLE=1 + wallet + capital-check)."""
     from polymaker.engine import Engine
+    from polymaker.live_gate import LiveGateError, assert_live_start_allowed
     from polymaker.logging import configure
 
     cfg = Config.load(config_dir)
-    report = assess_capital(cfg, bankroll)
     console.print(
         "[bold yellow]LIVE[/bold yellow] — real orders; micro caps "
         f"(exposure≤${cfg.risk.max_total_exposure_usdc:.0f}, "
-        f"daily kill≤${cfg.risk.daily_loss_kill_usdc:.0f})."
+        f"daily kill≤${cfg.risk.daily_loss_kill_usdc:.0f}). "
+        "Requires LIVE_ENABLE=1."
     )
-    if not report.ok:
-        for w in report.warnings:
-            console.print(f"[yellow]capital warning:[/yellow] {w}")
-        console.print(
-            "[red]Refusing live start: capital-check failed. "
-            "Tune config/ risk caps or fund to match --bankroll.[/red]"
-        )
-        raise typer.Exit(2)
-    if not cfg.secrets.has_wallet:
-        console.print(
-            "[red]Set PK and BROWSER_ADDRESS in local .env "
-            "(on your machine; never paste keys into chat).[/red]"
-        )
-        raise typer.Exit(2)
+    try:
+        assert_live_start_allowed(cfg, bankroll=bankroll)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
 
     configure(json_file=Path(cfg.paths.log_dir) / "live.jsonl")
     if cfg.engine.loop == "uvloop":
@@ -307,9 +305,15 @@ def livetest(
     notional: float = typer.Option(5.0, help="order notional in USDC"),
 ) -> None:
     """Live wallet round-trip: place a deep post-only order and cancel it (~$5)."""
+    from polymaker.live_gate import LiveGateError, assert_live_start_allowed
     from polymaker.livetest import run_livetest
 
     cfg = Config.load(config_dir)
+    try:
+        assert_live_start_allowed(cfg)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
     ok = asyncio.run(run_livetest(cfg, console, notional))
     raise typer.Exit(0 if ok else 1)
 
@@ -319,19 +323,37 @@ def moneydoctor(
     config_dir: str = typer.Option("config", help="config directory"),
 ) -> None:
     """LIVE trading self-test: rest a limit, then market buy + sell (spends a little)."""
+    from polymaker.live_gate import LiveGateError, assert_live_start_allowed
     from polymaker.moneydoctor import run_moneydoctor
 
     cfg = Config.load(config_dir)
+    try:
+        assert_live_start_allowed(cfg)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
     ok = asyncio.run(run_moneydoctor(cfg, console))
     raise typer.Exit(0 if ok else 1)
 
 
 @app.command(name="cancel-all")
 def cancel_all(config_dir: str = typer.Option("config", help="config directory")) -> None:
-    """Cancel all open orders for the wallet (panic button)."""
+    """Cancel all open orders (panic). Needs wallet; does NOT require LIVE_ENABLE."""
     from polymaker.execution.gateway import ExecutionGateway
+    from polymaker.live_gate import LiveGateError, assert_wallet_for_cancel, is_live_enabled
 
     cfg = Config.load(config_dir)
+    try:
+        assert_wallet_for_cancel(cfg)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from None
+    if not is_live_enabled(cfg.secrets):
+        console.print(
+            "[yellow]LIVE_ENABLE off — emergency cancel only "
+            "(new places remain blocked).[/yellow]"
+        )
+
     gw = ExecutionGateway(cfg)
 
     async def _go() -> None:

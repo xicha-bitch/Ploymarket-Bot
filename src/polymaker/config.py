@@ -166,6 +166,8 @@ class Secrets(BaseSettings):
 
     pk: str = Field(default="", alias="PK")
     browser_address: str = Field(default="", alias="BROWSER_ADDRESS")
+    # Explicit live place/start authorization. Must be exactly "1". Branch names ≠ auth.
+    live_enable: str = Field(default="", alias="LIVE_ENABLE")
     polygon_rpc: str | None = Field(default=None, alias="POLYGON_RPC")
     alert_webhook_url: str | None = Field(default=None, alias="ALERT_WEBHOOK_URL")
     # Polymarket builder API creds (self-generated via L2 auth: clob.create_builder_api_key)
@@ -179,6 +181,11 @@ class Secrets(BaseSettings):
     @property
     def has_wallet(self) -> bool:
         return bool(self.pk and self.browser_address)
+
+    @property
+    def live_trading_enabled(self) -> bool:
+        """True only when LIVE_ENABLE is exactly ``1``."""
+        return (self.live_enable or "").strip() == "1"
 
     @property
     def has_builder_creds(self) -> bool:

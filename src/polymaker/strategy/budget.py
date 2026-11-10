@@ -82,8 +82,9 @@ def filter_quotes_to_budget(
             kept_buys.append(q)
             remaining -= cost
         else:
+            reason = "infeasible" if cost > headroom_usdc + _EPS else "exhausted"
             skipped.append(
-                f"budget_reject side=BUY px={q.price:.4f} sz={q.size:.4f} "
+                f"budget_reject reason={reason} side=BUY px={q.price:.4f} sz={q.size:.4f} "
                 f"notional={cost:.4f} headroom_left={remaining:.4f}"
             )
 

@@ -30,6 +30,7 @@ from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQu
 from polymaker.marketdata.orderbook import BookView
 from polymaker.strategy.maker_gates import (
     apply_min_size_clamp,
+    is_min_size_feasible,
     pair_edge_ok,
     size_scale_for_book,
 )
@@ -67,6 +68,7 @@ class QuoteInputs:
     risk_size_scale: float = 1.0  # RiskManager may throttle size in [0,1]
     yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
     no_exit_urgency: float = 0.0
+    headroom_usdc: float | None = None
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
@@ -123,7 +125,9 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     # entry: BUY YES
     if add_yes:
         price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
-        if price is not None:
+        if price is not None and is_min_size_feasible(
+            price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
+        ):
             raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m)
             sized = apply_min_size_clamp(raw, scale=yes_book_scale, meta=m, profile=p)
             before = len(quotes)
@@ -137,7 +141,9 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     if add_no:
         no_fv = 1.0 - inp.fv
         price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
-        if price is not None:
+        if price is not None and is_min_size_feasible(
+            price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
+        ):
             raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m)
             sized = apply_min_size_clamp(raw, scale=no_book_scale, meta=m, profile=p)
             before = len(quotes)

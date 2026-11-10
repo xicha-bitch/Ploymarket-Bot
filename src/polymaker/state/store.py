@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     ts        REAL PRIMARY KEY,
     equity    REAL, net_cash REAL, inventory_value REAL, daily_pnl REAL
 );
+CREATE TABLE IF NOT EXISTS health_records (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    heartbeat      TEXT NOT NULL,
+    market         TEXT NOT NULL,
+    user_stream    TEXT NOT NULL,
+    telegram_poll  TEXT NOT NULL,
+    reconcile      TEXT NOT NULL,
+    detail_json    TEXT NOT NULL
+);
 """
 
 
@@ -116,9 +126,25 @@ class StateStore:
         self.positions[token_id] = pos
         self._persist_position(pos)
 
-    def reconcile_positions(self, api_positions: dict[str, tuple[float, float]]) -> None:
+    def reconcile_positions(
+        self,
+        api_positions: dict[str, tuple[float, float]],
+        *,
+        is_snapshot: bool = True,
+    ) -> None:
         """Overwrite sizes from REST, skipping tokens with in-flight trades or
-        a very recent fill (the optimistic value is more current there)."""
+        a very recent fill (the optimistic value is more current there).
+
+        When ``is_snapshot`` is True, ``api_positions`` is a complete authoritative
+        snapshot: local tokens missing from it are zeroed (still respecting
+        in-flight and recent-fill guards). Incremental updates must pass
+        ``is_snapshot=False`` so absent tokens are left untouched. A failed
+        REST read must not call this with None or a fabricated empty dict.
+        """
+        if api_positions is None:
+            raise ValueError(
+                "api_positions must not be None (REST failure is not an empty snapshot)"
+            )
         now = time.time()
         for token_id, (size, avg) in api_positions.items():
             if self._inflight.get(token_id, 0) > 0:
@@ -126,6 +152,15 @@ class StateStore:
             if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
                 continue
             self.set_position(token_id, size, avg)
+
+        if is_snapshot:
+            for token_id, pos in list(self.positions.items()):
+                if pos.size > 0 and token_id not in api_positions:
+                    if self._inflight.get(token_id, 0) > 0:
+                        continue
+                    if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
+                        continue
+                    self.set_position(token_id, 0.0, 0.0)
 
     # ── in-flight guard ─────────────────────────────────────────────────
     def mark_inflight(self, token_id: str) -> None:
@@ -256,6 +291,62 @@ class StateStore:
             )
             self._conn.commit()
 
+    def record_health(
+        self,
+        *,
+        heartbeat: str,
+        market: str,
+        user_stream: str,
+        telegram_poll: str,
+        reconcile: str,
+        detail: dict[str, object] | None = None,
+        ts: float | None = None,
+    ) -> int:
+        """Append one redacted local health row. Returns new seq (0 on failure)."""
+        payload = json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":"))
+        wall = time.time() if ts is None else float(ts)
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO health_records"
+                "(ts,heartbeat,market,user_stream,telegram_poll,reconcile,detail_json)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (wall, heartbeat, market, user_stream, telegram_poll, reconcile, payload),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+        except sqlite3.Error as exc:
+            log.warning("health_record_failed", err=str(exc)[:120])
+            return 0
+
+    def recent_health(self, limit: int = 10) -> list[dict[str, object]]:
+        """Newest-first redacted health rows for acceptance checks."""
+        n = max(1, min(int(limit), 100))
+        rows = self._conn.execute(
+            "SELECT seq,ts,heartbeat,market,user_stream,telegram_poll,reconcile,detail_json"
+            " FROM health_records ORDER BY seq DESC LIMIT ?",
+            (n,),
+        ).fetchall()
+        out: list[dict[str, object]] = []
+        for row in rows:
+            detail: object
+            try:
+                detail = json.loads(row["detail_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                detail = {}
+            out.append(
+                {
+                    "seq": int(row["seq"]),
+                    "ts": float(row["ts"]),
+                    "heartbeat": str(row["heartbeat"]),
+                    "market": str(row["market"]),
+                    "user_stream": str(row["user_stream"]),
+                    "telegram_poll": str(row["telegram_poll"]),
+                    "reconcile": str(row["reconcile"]),
+                    "detail": detail,
+                }
+            )
+        return out
+
     def snapshot(self) -> dict[str, object]:
         return {
             "positions": {k: json.loads(_pos_json(v)) for k, v in self.positions.items() if v.size > 0},
@@ -266,6 +357,10 @@ class StateStore:
         """Total fills recorded in SQLite (deduped by trade_id)."""
         row = self._conn.execute("SELECT COUNT(*) AS n FROM fills").fetchone()
         return int(row["n"]) if row is not None else 0
+
+    def fills_count(self) -> int:
+        """Alias used by Telegram status copy."""
+        return self.fill_count()
 
 
 def _pos_json(p: Position) -> str:

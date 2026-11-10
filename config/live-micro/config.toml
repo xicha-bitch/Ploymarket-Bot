@@ -1,0 +1,44 @@
+# Official live-micro profile for this operator.
+# These risk caps were set intentionally for the current small-capital live
+# run (about 1 pUSD scale). Do not enlarge them to the generic 20-30 bankroll
+# defaults in config/config.toml. Secrets stay in local .env only.
+
+[wallet]
+chain_id = 137
+# 0=EOA, 1=magic proxy, 2=Gnosis Safe proxy, 3=POLY_1271 deposit wallet (current)
+signature_type = 3
+clob_host = "https://clob.polymarket.com"
+gamma_host = "https://gamma-api.polymarket.com"
+data_api_host = "https://data-api.polymarket.com"
+polygon_rpc = "https://polygon-bor-rpc.publicnode.com"
+
+[engine]
+debounce_ms = 250
+quoter_tick_s = 60
+reconcile_interval_s = 20
+catalog_refresh_s = 300
+heartbeat = true
+heartbeat_interval_s = 5
+journal = true
+loop = "uvloop"
+
+[risk]
+# Intentional micro-live caps. Not a bug, not a temporary typo, do not enlarge.
+max_total_exposure_usdc = 1.0
+max_event_group_loss_usdc = 0.8
+max_market_notional_usdc = 0.55
+daily_loss_kill_usdc = 0.2
+ws_stale_halt_s = 10.0
+user_ws_blind_halt_s = 15.0
+heartbeat_halt_failures = 3
+max_order_error_rate = 0.25
+
+[execution]
+rate_budget_fraction = 0.25
+post_only = true
+max_orders_per_batch = 5
+
+[paths]
+db = "state.db"
+journal_dir = "journal"
+log_dir = "logs"

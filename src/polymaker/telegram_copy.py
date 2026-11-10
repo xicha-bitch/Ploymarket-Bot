@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+# Exchange-confirmed resting exit SELL state. Never treat "unknown" as retained.
+ExitOrderStatus = Literal["resting", "none", "unknown"]
 
 
 def fmt_money_pusd(value: float | None, *, digits: int = 6) -> str:
@@ -22,6 +25,22 @@ def fmt_int_or_unknown(value: int | None) -> str:
     return str(value)
 
 
+def fmt_exit_order_status_zh(
+    status: ExitOrderStatus | None,
+    *,
+    sell_count: int | None = None,
+) -> str:
+    """Chinese line for exchange exit-order confirmation (not strategy intent)."""
+    if status is None:
+        return "未知/未提供"
+    if status == "resting":
+        n = sell_count if sell_count is not None else 0
+        return f"已确认有挂单（SELL={n}）"
+    if status == "none":
+        return "已确认无"
+    return "未知（读取失败；不视为仍保留）"
+
+
 def format_status_report(
     *,
     markets: int,
@@ -34,8 +53,21 @@ def format_status_report(
     session_daily_delta: float | None,
     stop_requested: bool,
     positions: dict[str, Any] | None,
+    entry_blocked_infeasible: bool | None = None,
+    one_sided_inventory: bool | None = None,
+    exit_quoting_allowed: bool | None = None,
+    exit_order_status: ExitOrderStatus | None = None,
+    exit_sell_count: int | None = None,
+    # Legacy alias: bool True/False maps to resting/none; None stays unknown.
+    exit_path_retained: bool | None = None,
 ) -> str:
     """Build Chinese /status body with real newlines and clear 口径 labels."""
+    # Compat: older callers may still pass exit_path_retained.
+    if exit_order_status is None and exit_path_retained is not None:
+        exit_order_status = "resting" if exit_path_retained else "none"
+    if exit_quoting_allowed is None and exit_path_retained is not None:
+        exit_quoting_allowed = bool(exit_path_retained)
+
     lines = [
         "【账户与挂单】",
         f"监控市场数：{markets}",
@@ -84,6 +116,26 @@ def format_status_report(
             size_s = f"{float(size):.4f} 份" if size is not None else "未知/读取失败"
             avg_s = f"{float(avg):.4f} pUSD/份" if avg is not None else "未知/读取失败"
             lines.append(f"· {str(tok)[:12]}… 数量={size_s} 均价={avg_s}")
+    if one_sided_inventory is None and positions:
+        held = [
+            tok
+            for tok, pos in positions.items()
+            if float((pos or {}).get("size") or 0.0) > 0
+        ]
+        one_sided_inventory = len(held) == 1
+    lines.extend(
+        [
+            "",
+            "【做市防护与可行性】",
+            f"· 不可行入场被阻止：{fmt_bool_zh(entry_blocked_infeasible) if entry_blocked_infeasible is not None else '未知/未提供'}（最小下单名义超过可用预算时跳过新买单，避免反复拒单刷屏）",
+            f"· 单边库存：{fmt_bool_zh(one_sided_inventory) if one_sided_inventory is not None else '未知/未提供'}"
+            + ("（仅持有单侧代币）" if one_sided_inventory else ""),
+            f"· 退出报价允许：{fmt_bool_zh(exit_quoting_allowed) if exit_quoting_allowed is not None else '未知/未提供'}"
+            "（代码允许对已有持仓挂被动卖单/减仓；≠交易所已有挂单）",
+            f"· 交易所退出卖单：{fmt_exit_order_status_zh(exit_order_status, sell_count=exit_sell_count)}"
+            "（三态：有挂单 / 无 / 未知；未知不视为仍保留）",
+        ]
+    )
     return "\n".join(lines)
 
 

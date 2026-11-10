@@ -62,6 +62,12 @@ class MarketDataService:
         # genuinely down connection is. Book-mutation recency can't tell the two
         # apart on a thin market, so we gate on connection liveness instead.
         self.disconnected_since: float = 0.0
+        self._needs_snapshot: set[str] = set()
+        # redacted health counters (no payloads): distinguish cold empty vs drop
+        self.last_message_ts: float = 0.0
+        self.last_snapshot_ts: float = 0.0
+        self.message_count: int = 0
+        self.snapshot_count: int = 0
 
     # ── subscription management ─────────────────────────────────────────
     def set_markets(self, markets: list[tuple[str, list[str]]]) -> None:
@@ -71,6 +77,7 @@ class MarketDataService:
             for tok in tokens:
                 self._token_condition[tok] = cond
                 self.books.setdefault(tok, OrderBook())
+                self._needs_snapshot.add(tok)
                 subs.append(tok)
         self._subs = subs
 
@@ -89,6 +96,66 @@ class MarketDataService:
         """Local receive time of the last book mutation (skew-proof staleness)."""
         b = self.books.get(token_id)
         return b.local_ts if b else 0.0
+
+    def is_fresh(self, token_id: str) -> bool:
+        """True if this book may be used for quoting.
+
+        A real disconnect clears depth and sets disconnected_since; the book is
+        not fresh until a new snapshot arrives. A still-connected quiet book
+        that already has depth remains fresh. Unit tests that inject a snapshot
+        without starting the WS (disconnected_since == 0) also count as fresh.
+        """
+        if token_id in self._needs_snapshot:
+            return False
+        book = self.books.get(token_id)
+        has_data = book is not None and (book.last_update_ts > 0.0 or bool(book.bids or book.asks))
+        if not has_data:
+            return False
+        if not self.connected and self.disconnected_since > 0.0:
+            return False
+        return True
+
+    def is_stale(self, token_id: str) -> bool:
+        """True when this book must not be used for quoting."""
+        return not self.is_fresh(token_id)
+
+    def needs_snapshot(self, token_id: str) -> bool:
+        return token_id in self._needs_snapshot
+
+    def ack_snapshot(self, token_id: str) -> None:
+        """Mark that an authoritative book snapshot has been applied."""
+        self._needs_snapshot.discard(token_id)
+
+    def health_market_state(self) -> str:
+        """Classify market-feed health for local records.
+
+        Cold/empty books on a live connection are ``cold_empty``, never
+        ``disconnected``. Snapshot vs message distinguish feed activity.
+        """
+        if not self.connected:
+            return "disconnected"
+        if self.last_snapshot_ts > 0.0 and self.last_snapshot_ts + 1e-9 >= self.last_message_ts:
+            return "snapshot"
+        if self.last_message_ts > 0.0:
+            return "message"
+        # connected but quiet / no depth yet — not a disconnect
+        any_depth = any(bool(b.bids or b.asks) for b in self.books.values())
+        if not any_depth:
+            return "cold_empty"
+        return "connected"
+
+    def clear_books(self) -> None:
+        """Drop cached depth and require a fresh snapshot before quoting."""
+        self._needs_snapshot.update(self.books.keys())
+        for tok in list(self.books.keys()):
+            self.books[tok] = OrderBook()
+            self._wake(tok)
+
+    def on_disconnect(self) -> None:
+        """Handle a real connection drop; do not use this for quiet thin books."""
+        self.connected = False
+        self.disconnected_since = time.time()
+        self.clear_books()
 
     # ── run loop ────────────────────────────────────────────────────────
     async def run(self) -> None:
@@ -126,8 +193,7 @@ class MarketDataService:
                 async for raw in ws:
                     self._handle(raw)
             finally:
-                self.connected = False
-                self.disconnected_since = time.time()
+                self.on_disconnect()
 
     def stop(self) -> None:
         self._stop.set()
@@ -138,6 +204,8 @@ class MarketDataService:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return
+        self.last_message_ts = time.time()
+        self.message_count += 1
         for msg in data if isinstance(data, list) else [data]:
             if not isinstance(msg, dict):
                 continue
@@ -162,6 +230,9 @@ class MarketDataService:
         if upd.tick_size:
             book.set_tick_size(upd.tick_size)
         book.apply_snapshot(upd.bids, upd.asks, upd.ts, upd.book_hash)
+        self.ack_snapshot(upd.asset_id)
+        self.last_snapshot_ts = time.time()
+        self.snapshot_count += 1
         self._journal_write("book", msg, upd.ts)
         self._wake(upd.asset_id)
 

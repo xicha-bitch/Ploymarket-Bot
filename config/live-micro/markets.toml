@@ -1,0 +1,7 @@
+# Official live-micro trade list (not a secret). The generic config/markets.toml
+# stays empty as a template. Production already uses this market with micro-tight.
+
+[[markets]]
+slug    = "us-announces-end-of-iranian-blockade-by-november-15-2026"
+profile = "micro-tight"
+enabled = true

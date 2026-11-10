@@ -169,3 +169,53 @@ def test_reconcile_matches_layers_one_to_one():
     assert plan.to_cancel == []
     assert len(plan.to_place) == 1  # only the missing deeper layer
     assert plan.to_place[0].price == 0.47
+
+
+def test_reconcile_snapshot_zeros_missing_tokens(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    s.set_position("keep", 10.0, 0.4)
+    s.set_position("gone", 8.0, 0.2)
+    s.reconcile_positions({"keep": (11.0, 0.41)}, is_snapshot=True)
+    assert s.position("keep").size == 11.0
+    assert s.position("gone").size == 0.0
+    s.close()
+
+
+def test_reconcile_incremental_does_not_zero_absent(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    s.set_position("keep", 10.0, 0.4)
+    s.set_position("other", 8.0, 0.2)
+    s.reconcile_positions({"keep": (12.0, 0.5)}, is_snapshot=False)
+    assert s.position("keep").size == 12.0
+    assert s.position("other").size == 8.0
+    s.close()
+
+
+def test_reconcile_snapshot_preserves_inflight_and_recent_missing(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    s.set_position("fly", 5.0, 0.3)
+    s.set_position("recent", 6.0, 0.3)
+    s.mark_inflight("fly")
+    s._last_fill_ts["recent"] = __import__("time").time()
+    s.reconcile_positions({"only-new": (1.0, 0.1)}, is_snapshot=True)
+    assert s.position("fly").size == 5.0
+    assert s.position("recent").size == 6.0
+    s.close()
+
+
+def test_reconcile_positions_rejects_none(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    try:
+        s.reconcile_positions(None)  # type: ignore[arg-type]
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    s.close()
+
+
+def test_reconcile_empty_snapshot_zeros_all(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    s.set_position("gone", 5.0, 0.4)
+    s.reconcile_positions({}, is_snapshot=True)
+    assert s.position("gone").size == 0.0
+    s.close()

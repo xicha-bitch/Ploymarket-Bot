@@ -5,6 +5,7 @@ from __future__ import annotations
 from polymaker.telegram_copy import (
     format_pnl_report,
     format_status_report,
+    fmt_exit_order_status_zh,
     fmt_money_pusd,
 )
 
@@ -71,3 +72,70 @@ def test_pnl_hides_delta_when_no_fills() -> None:
     assert "暂不可用" in text
     assert "不是交易所账户总资产" in text
     assert "【账户总资产】" not in text
+
+
+def test_status_report_distinguishes_exit_quoting_vs_exchange_orders() -> None:
+    text = format_status_report(
+        markets=1,
+        open_orders=1,
+        balance_clob=0.5,
+        resting_buy=0.0,
+        position_mark=0.5,
+        fills=0,
+        session_equity=0.5,
+        session_daily_delta=0.0,
+        stop_requested=False,
+        positions={"yes-token": {"size": 10.0, "avg_price": 0.05}},
+        entry_blocked_infeasible=True,
+        one_sided_inventory=True,
+        exit_quoting_allowed=True,
+        exit_order_status="resting",
+        exit_sell_count=1,
+    )
+    assert "不可行入场被阻止：是" in text
+    assert "单边库存：是" in text
+    assert "退出报价允许：是" in text
+    assert "交易所退出卖单：已确认有挂单（SELL=1）" in text
+    assert "退出路径仍保留：是" not in text  # no longer hardcoded bool success
+    assert "【账户总资产】" not in text
+
+
+def test_exit_order_unknown_never_reads_as_retained() -> None:
+    assert "不视为仍保留" in fmt_exit_order_status_zh("unknown")
+    text = format_status_report(
+        markets=1,
+        open_orders=0,
+        balance_clob=0.5,
+        resting_buy=0.0,
+        position_mark=0.5,
+        fills=0,
+        session_equity=0.5,
+        session_daily_delta=0.0,
+        stop_requested=False,
+        positions={"yes-token": {"size": 10.0, "avg_price": 0.05}},
+        exit_quoting_allowed=True,
+        exit_order_status="unknown",
+    )
+    assert "退出报价允许：是" in text
+    assert "未知（读取失败" in text
+    assert "不视为仍保留" in text
+    assert "已确认有挂单（SELL=" not in text
+
+
+def test_exit_order_confirmed_none() -> None:
+    text = format_status_report(
+        markets=1,
+        open_orders=0,
+        balance_clob=0.5,
+        resting_buy=0.0,
+        position_mark=0.5,
+        fills=0,
+        session_equity=0.5,
+        session_daily_delta=0.0,
+        stop_requested=False,
+        positions={"yes-token": {"size": 10.0, "avg_price": 0.05}},
+        exit_quoting_allowed=True,
+        exit_order_status="none",
+        exit_sell_count=0,
+    )
+    assert "交易所退出卖单：已确认无" in text

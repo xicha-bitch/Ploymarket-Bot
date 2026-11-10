@@ -1,0 +1,69 @@
+# Official live-micro strategy sizes. Intentional 0.25 / 0.9 caps for the
+# current small-capital live run. Do not enlarge to the generic config/strategy.toml
+# micro-tight 2.5 / 6.0 or micro-capital 4.0 / 10.0 defaults.
+
+[profiles.micro-capital]
+micro_levels         = 3
+flow_ewma_halflife_s = 120
+gamma                = 0.7
+delta_min_ticks      = 2
+c_vol                = 1.5
+c_tox                = 3.0
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+base_size_usdc       = 0.25
+q_max_usdc           = 0.9
+q_soft_frac          = 0.5
+layers               = 1
+reward_size_mult     = 1.0
+layer_step_ticks     = 2
+reprice_ticks        = 2
+resize_frac          = 0.25
+min_edge_ticks       = 1
+pair_edge_ticks      = 1
+thin_depth_mult      = 10.0
+air_gap_ticks        = 8
+event_cooloff_s      = 45
+event_jump_ticks     = 6
+event_sweep_mult     = 4.0
+event_sweep_frac     = 0.8
+trend_flow_z         = 1.8
+trend_vol_ratio      = 3.0
+end_date_taper_days  = 7
+reduce_only_hours    = 24
+halt_before_hours    = 2
+exit_urgency_s       = 600
+merge_min_size       = 5.0
+
+[profiles.micro-tight]
+micro_levels         = 3
+flow_ewma_halflife_s = 120
+gamma                = 0.8
+delta_min_ticks      = 2
+c_vol                = 2.0
+c_tox                = 3.5
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+base_size_usdc       = 0.25
+q_max_usdc           = 0.9
+q_soft_frac          = 0.5
+layers               = 1
+reward_size_mult     = 1.0
+layer_step_ticks     = 2
+reprice_ticks        = 3
+resize_frac          = 0.3
+min_edge_ticks       = 1
+pair_edge_ticks      = 1
+thin_depth_mult      = 10.0
+air_gap_ticks        = 8
+event_cooloff_s      = 60
+event_jump_ticks     = 5
+event_sweep_mult     = 3.0
+event_sweep_frac     = 0.8
+trend_flow_z         = 2.0
+trend_vol_ratio      = 4.0
+end_date_taper_days  = 7
+reduce_only_hours    = 24
+halt_before_hours    = 2
+exit_urgency_s       = 600
+merge_min_size       = 5.0

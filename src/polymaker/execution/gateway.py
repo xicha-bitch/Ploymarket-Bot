@@ -39,9 +39,36 @@ _POSITIONS_MAX_PAGES = 50
 class PositionsReadError(RuntimeError):
     """Data-API positions read failed — must NOT be treated as an empty book."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_s = retry_after_s
+
+
+class OpenOrdersReadError(RuntimeError):
+    """CLOB open-orders read failed — must NOT be treated as an empty book."""
+
+
+def parse_retry_after_s(raw: str | None) -> float | None:
+    """Parse Retry-After as delay-seconds. HTTP-date forms are ignored (None)."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        return None
+    if seconds < 0 or seconds != seconds:  # NaN guard
+        return None
+    return min(seconds, 300.0)
 
 
 def _tick_str(tick: float) -> str:
@@ -507,8 +534,13 @@ class ExecutionGateway:
 
     # ── reads ───────────────────────────────────────────────────────────
     async def open_orders(self) -> list[OpenOrder]:
+        """Return live open orders. Empty list means confirmed none.
+
+        Transport / client failures raise OpenOrdersReadError — callers must
+        not treat that as an empty book (exit-path / reconcile correctness).
+        """
         if self._client is None:
-            return []
+            raise OpenOrdersReadError("open_orders unavailable: client not connected")
 
         def _get() -> list[OpenOrder]:
             raw = self._client.get_open_orders()
@@ -536,9 +568,11 @@ class ExecutionGateway:
 
         try:
             return await self._io(_get)
+        except OpenOrdersReadError:
+            raise
         except Exception as exc:  # noqa: BLE001
             log.warning("open_orders_failed", err=str(exc))
-            return []
+            raise OpenOrdersReadError(f"open_orders read failed: {exc}") from exc
 
     async def positions(self) -> dict[str, tuple[float, float]]:
         """{token_id: (size, avg_price)} from Data API v2 (reconcile use).
@@ -570,6 +604,7 @@ class ExecutionGateway:
                         body = ""
                         with contextlib.suppress(Exception):
                             body = (r.text or "")[:180]
+                        retry_after_s = parse_retry_after_s(r.headers.get("Retry-After"))
                         log.warning(
                             "positions_failed",
                             status=r.status_code,
@@ -577,11 +612,13 @@ class ExecutionGateway:
                             path="/v2/positions",
                             # funder prefix only — never full keys/secrets
                             funder=user[:10],
+                            retry_after_s=retry_after_s,
                             detail=body,
                         )
                         raise PositionsReadError(
                             f"data-api GET /v2/positions HTTP {r.status_code}: {body}",
                             status_code=r.status_code,
+                            retry_after_s=retry_after_s,
                         )
                     rows, cursor = parse_v2_positions_page(r.json())
                     for row in rows:

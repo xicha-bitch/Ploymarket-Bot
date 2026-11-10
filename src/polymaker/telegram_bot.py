@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -113,6 +114,10 @@ class TelegramBot:
         # None = not checked yet; False = blocked (group/unknown/getChat fail).
         self._chat_allowed: bool | None = None
         self._chat_block_reason: str = ""
+        # redacted health: successful long-poll rounds (no token/chat values)
+        self.last_poll_ok_ts: float = 0.0
+        self.poll_ok_count: int = 0
+        self.poll_error_count: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -384,9 +389,12 @@ class TelegramBot:
         while not self._stop.is_set():
             try:
                 await self._poll_once()
+                self.last_poll_ok_ts = time.time()
+                self.poll_ok_count += 1
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
+                self.poll_error_count += 1
                 log.warning("telegram_poll_error", err=type(exc).__name__)
                 await asyncio.sleep(2.0)
 

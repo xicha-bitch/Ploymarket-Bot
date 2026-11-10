@@ -123,6 +123,23 @@ class RiskManager:
         )
         return RiskDecision(False, False, scale, "")
 
+    def filled_market_notional(self, meta: MarketMeta) -> float:
+        """Filled-inventory notional for this market (no resting orders)."""
+        return self._market_notional(meta)
+
+    def filled_total_exposure(self) -> float:
+        """Filled-inventory notional across all tokens (no resting orders)."""
+        return self._total_exposure()
+
+    def resting_buy_notional(self, meta: MarketMeta) -> float:
+        """Resting BUY notional on this market's tokens."""
+        resting = 0.0
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            for o in self._store.orders_for(tok):
+                if o.side is Side.BUY and o.size > 0:
+                    resting += o.notional
+        return resting
+
     def _market_notional(self, meta: MarketMeta) -> float:
         """Filled-inventory notional for this market. Deliberately does NOT count
         our own resting BUY orders: those are the quotes we're about to replace,
@@ -131,7 +148,9 @@ class RiskManager:
         instead by small per-quote sizes + the position cap that this drives.
 
         See ``worst_case_market_notional`` for an advisory filled+resting figure
-        (does not drive the hard evaluate() taper — avoids churn)."""
+        (does not drive the hard evaluate() taper — avoids churn). Place-time
+        budget gates in the engine enforce resting+filled vs collateral/caps.
+        """
         total = 0.0
         for tok in (meta.yes.token_id, meta.no.token_id):
             pos = self._store.position(tok)
@@ -144,13 +163,7 @@ class RiskManager:
         Not used for hard REDUCE_ONLY (that would churn); useful for logging /
         size_scale soft advice and unit tests of micro-cap overshoot risk.
         """
-        filled = self._market_notional(meta)
-        resting = 0.0
-        for tok in (meta.yes.token_id, meta.no.token_id):
-            for o in self._store.orders_for(tok):
-                if o.side is Side.BUY and o.size > 0:
-                    resting += o.notional
-        return filled + resting
+        return self._market_notional(meta) + self.resting_buy_notional(meta)
 
     def advisory_size_scale(self, meta: MarketMeta) -> float:
         """Soft scale from worst-case filled+resting vs market cap (advisory only)."""

@@ -43,12 +43,17 @@ from polymaker.strategy.estimators import (
     MarkoutTracker,
     VolEstimator,
 )
+from polymaker.strategy.budget import filter_quotes_to_budget, place_headroom_usdc
 from polymaker.strategy.maker_gates import compute_exit_urgency
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
 
 log = get_logger("engine")
+
+# CLOB maker fee is 0; keep a tiny buffer for rounding / allowance dust.
+_FEE_BUFFER_USDC = 0.01
+_COLLATERAL_REFRESH_S = 20.0
 
 
 class Engine:
@@ -94,11 +99,14 @@ class Engine:
         self._user_started = False  # user WS task launched (live mode)
         self._hb_was_down = False
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
+        self._collateral_usdc: float | None = None
+        self._collateral_ts: float = 0.0
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
         self._running = True
         await self.gateway.connect()
+        await self._refresh_collateral(force=True)
         await self._resolve_markets()
         if not self.metas:
             log.warning("no_markets_selected", hint="add markets to config/markets.toml, run `polymaker scan`")
@@ -536,16 +544,37 @@ class Engine:
                 log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                 self._dirty[cid].set()  # retry soon
             else:
-                placed = await self._place_with_intent(cid, meta, plan.to_place)
-                placed_n = len(placed)
-                self.risk.note_order_result(len(placed) == len(plan.to_place))
-                for o in placed:
-                    self.state.upsert_order(o)
-                if len(placed) < len(plan.to_place):
-                    # QUARANTINE: a failed/partial batch may still have posted
-                    # orders we don't have ids for. Cancel everything on these
-                    # tokens (idempotent) and resync — never risk an untracked order.
-                    await self._quarantine(meta, reason="place_incomplete")
+                to_place = await self._budget_filter_quotes(cid, meta, plan.to_place)
+                if not to_place:
+                    # Affordable set empty after budget gate — not an exchange
+                    # reject loop; skip place without counting as order error.
+                    log.info(
+                        "budget_skip_empty",
+                        cid=cid[:8],
+                        wanted=len(plan.to_place),
+                        collateral=None if self._collateral_usdc is None
+                        else round(self._collateral_usdc, 6),
+                    )
+                else:
+                    placed = await self._place_with_intent(cid, meta, to_place)
+                    placed_n = len(placed)
+                    self.risk.note_order_result(len(placed) == len(to_place))
+                    for o in placed:
+                        self.state.upsert_order(o)
+                    if len(placed) < len(to_place):
+                        # QUARANTINE: a failed/partial batch may still have posted
+                        # orders we don't have ids for. Cancel everything on these
+                        # tokens (idempotent) and resync — never risk an untracked order.
+                        await self._quarantine(meta, reason="place_incomplete")
+                    elif placed_n > 0:
+                        # optimistic local reserve until next collateral refresh
+                        spent = sum(
+                            o.price * o.size for o in placed if o.side is Side.BUY
+                        )
+                        if self._collateral_usdc is not None and spent > 0:
+                            self._collateral_usdc = max(
+                                0.0, self._collateral_usdc - spent
+                            )
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),
@@ -553,6 +582,63 @@ class Engine:
                  tox=round(est.markout.toxicity, 3), flowz=round(est.flow.z, 2),
                  yes_exit_u=round(yes_u, 2), no_exit_u=round(no_u, 2))
         self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
+
+    async def _refresh_collateral(self, *, force: bool = False) -> float | None:
+        """Refresh CLOB collateral snapshot (no secrets logged)."""
+        now = time.time()
+        if (
+            not force
+            and self._collateral_usdc is not None
+            and (now - self._collateral_ts) < _COLLATERAL_REFRESH_S
+        ):
+            return self._collateral_usdc
+        try:
+            bal = await self.gateway.collateral_balance()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("collateral_refresh_failed", err=str(exc)[:120])
+            return self._collateral_usdc
+        self._collateral_usdc = bal
+        self._collateral_ts = now
+        log.info("collateral_refreshed", available=round(bal, 6))
+        return bal
+
+    async def _budget_filter_quotes(
+        self, cid: str, meta: MarketMeta, quotes: list[Quote]
+    ) -> list[Quote]:
+        """Drop BUY quotes that exceed resting+filled+fee headroom (no undersize split)."""
+        await self._refresh_collateral(force=False)
+        available = self._collateral_usdc
+        if available is None:
+            log.warning("budget_unknown_collateral", cid=cid[:8], action="skip_place")
+            return []
+
+        resting = self.risk.resting_buy_notional(meta)
+        filled_mkt = self.risk.filled_market_notional(meta)
+        filled_total = self.risk.filled_total_exposure()
+
+        headroom = place_headroom_usdc(
+            available_usdc=available,
+            resting_buy_usdc=resting,
+            filled_market_usdc=filled_mkt,
+            filled_total_usdc=filled_total,
+            max_market_notional_usdc=self.cfg.risk.max_market_notional_usdc,
+            max_total_exposure_usdc=self.cfg.risk.max_total_exposure_usdc,
+            fee_buffer_usdc=_FEE_BUFFER_USDC,
+        )
+        decision = filter_quotes_to_budget(quotes, headroom_usdc=headroom)
+        for msg in decision.skipped:
+            log.warning("budget_reject", cid=cid[:8], detail=msg)
+        if decision.skipped:
+            log.info(
+                "budget_filter",
+                cid=cid[:8],
+                available=round(available, 6),
+                resting=round(resting, 6),
+                headroom=round(headroom, 6),
+                kept=len(decision.kept),
+                skipped=len(decision.skipped),
+            )
+        return list(decision.kept)
 
     async def _place_with_intent(
         self, cid: str, meta: MarketMeta, quotes: list[Quote]

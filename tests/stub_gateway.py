@@ -59,6 +59,10 @@ class StubGateway:
     async def open_orders(self) -> list[OpenOrder]:
         return []
 
+    async def collateral_balance(self) -> float:
+        """Plenty of stub collateral so budget gates do not skip unit-test places."""
+        return 10_000.0
+
     async def market_order(self, *args: object, **kwargs: object) -> dict[str, object]:
         return {"status": "stub"}
 

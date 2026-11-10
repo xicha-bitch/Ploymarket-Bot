@@ -55,22 +55,26 @@ def size_scale_for_book(
 ) -> float:
     """Scale quote size for thin / gappy books.
 
-    Returns 1.0 on deep continuous books; drops toward a min-size-only regime
-    when near-touch depth is thin or there is an air pocket under the bid
-    (primary live adverse-selection mode from operator notes).
+    Returns 1.0 on deep continuous books; drops toward a **exchange-min-only**
+    regime when near-touch depth is thin or there is an air pocket under the
+    bid. ``rewards_min_size`` is used only as a *depth reference* for what
+    "thin" means (reward program scale), **not** as a hard order floor —
+    callers must clamp with ``apply_min_size_clamp`` (exchange min) and optional
+    soft reward targeting separately.
     """
     thin_mult = max(0.0, profile.thin_depth_mult)
     gap_lim = max(1, profile.air_gap_ticks)
     depth = min(view.bid_depth, view.ask_depth)
-    floor = max(rewards_min_size, 1.0)
-    thin = depth < floor * thin_mult if thin_mult > 0 else False
+    # Depth reference: rewards program size if known, else 1 share.
+    depth_ref = max(rewards_min_size, 1.0)
+    thin = depth < depth_ref * thin_mult if thin_mult > 0 else False
     gap = bid_air_gap_ticks(view, tick) >= gap_lim
     if thin or gap:
-        return 0.0  # caller clamps to reward / exchange min only
-    # soft taper: depth between floor*thin_mult and 2× that
+        return 0.0  # caller clamps to exchange min only
+    # soft taper: depth between depth_ref*thin_mult and 2× that
     if thin_mult <= 0:
         return 1.0
-    soft = floor * thin_mult
+    soft = depth_ref * thin_mult
     hard = soft * 2.0
     if depth >= hard:
         return 1.0
@@ -113,14 +117,24 @@ def apply_min_size_clamp(
     meta: MarketMeta,
     profile: StrategyProfile,
 ) -> float:
-    """Apply book scale: 0 → reward/exchange min only; (0,1) tapers; 1 unchanged."""
+    """Apply book scale with **exchange min as the only hard floor**.
+
+    - scale ≈ 1: leave ``size_shares`` unchanged
+    - scale ≈ 0 (thin/gappy): clamp to ``meta.min_order_size`` only
+    - 0 < scale < 1: taper, still floored at exchange min
+
+    Rewards min size is a soft scoring *target* applied later in ``_add_layers``
+    when the sized order is already near that target — it must never inflate a
+    thin-book quote from exchange-min dust up to rewardsMinSize (e.g. 5 → 200).
+    ``profile.reward_size_mult`` is consulted there, not here.
+    """
+    del profile  # hard floor is exchange-only; reward soft-target lives in quoting
     if size_shares <= 0:
         return 0.0
+    hard = max(0.0, meta.min_order_size)
     if scale >= 1.0 - _EPS:
         return size_shares
-    reward_floor = meta.rewards_min_size * profile.reward_size_mult
-    floor = max(meta.min_order_size, reward_floor)
     if scale <= _EPS:
-        return round(floor, 2) if floor > 0 else 0.0
+        return round(hard, 2) if hard > 0 else 0.0
     tapered = size_shares * scale
-    return round(max(tapered, floor), 2)
+    return round(max(tapered, hard), 2)

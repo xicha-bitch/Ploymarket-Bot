@@ -1,7 +1,7 @@
 [project]
 name = "polymaker"
-version = "2.2.0"
-description = "Live-only micro-capital fork of poly-maker: maker-only Polymarket CLOB V2 bot"
+version = "2.3.0"
+description = "Live-only micro-capital fork of poly-maker: maker-only Polymarket CLOB V2 bot (LIVE_ENABLE gate)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }

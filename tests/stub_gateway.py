@@ -1,4 +1,8 @@
-"""In-memory execution stub for unit tests (not a product paper/sim mode)."""
+"""In-memory execution stub for unit tests.
+
+Engineering verification only — not a product paper/sim/dry-run mode.
+The product remains LIVE-ONLY (see LIVE_ENABLE gate).
+"""
 
 from __future__ import annotations
 

@@ -54,9 +54,15 @@ def assess_capital(cfg: Config, bankroll_usdc: float) -> CapitalReport:
     if rebate_warn:
         tips.append(rebate_warn)
 
-    tips.append("Live-only path: `polymaker doctor` then `polymaker run` (micro caps enforced).")
+    tips.append(
+        "Live-only: set LIVE_ENABLE=1 + PK/BROWSER_ADDRESS in local .env, then "
+        "`polymaker doctor` → `polymaker run` (micro caps enforced)."
+    )
     tips.append("Prefer post-only / maker path; taker copy burns edge on fees + latency.")
-    tips.append("Set PK + BROWSER_ADDRESS only in local .env; fund a hot wallet with ONLY this bankroll.")
+    tips.append(
+        "Panic: `polymaker cancel-all` needs wallet only (LIVE_ENABLE not required). "
+        "Never paste keys into chat."
+    )
 
     ok = len(warnings) == 0 and bankroll_usdc > 0
     return CapitalReport(

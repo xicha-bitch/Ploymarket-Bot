@@ -1,9 +1,20 @@
 # Micro-capital live guide (~$20–30)
 
 Fork of [warproxxx/poly-maker](https://github.com/warproxxx/poly-maker) with **small live risk caps**.  
-**Live-only** — there is no paper/sim/dry-run mode.
+**Live-only product** — there is no paper/sim/dry-run product mode. Stubs in `tests/` are engineering verification only.
 
 A GitHub repo is just the published source tree (code + history) you clone; this folder is that code.
+
+## Live authorization (fail-closed)
+
+| Requirement | Role |
+|-------------|------|
+| `LIVE_ENABLE=1` in local `.env` | Explicit place/start authorization (branch names ≠ auth) |
+| `PK` + `BROWSER_ADDRESS` | Wallet for CLOB auth |
+| `polymaker capital-check` | Caps must fit your bankroll before `run` |
+| `polymaker cancel-all` | Panic cancel — **wallet only**, works even when `LIVE_ENABLE` is off |
+
+Without `LIVE_ENABLE=1`, `run` / `livetest` / `moneydoctor` and gateway **place/market-order** refuse. Existing open orders can still be cancelled.
 
 ## Live defaults (safety)
 
@@ -22,8 +33,9 @@ Upstream large presets: `config-original/`.
 
 Copy `.env.example` → `.env` on **your** machine:
 
-| Var | Required for live | Meaning |
-|-----|-------------------|---------|
+| Var | Required for live place | Meaning |
+|-----|-------------------------|---------|
+| `LIVE_ENABLE` | yes (`=1`) | Explicit live place/start gate |
 | `PK` | yes | Signer private key (hot wallet only) |
 | `BROWSER_ADDRESS` | yes | Polymarket deposit/funder address from the UI |
 | `POLYGON_RPC` | optional | Custom Polygon RPC |
@@ -36,17 +48,19 @@ Also set `signature_type` in `config/config.toml` to match your account (often `
 
 ```bash
 uv sync --extra dev
-cp .env.example .env          # fill PK + BROWSER_ADDRESS locally
+cp .env.example .env          # fill PK + BROWSER_ADDRESS locally; leave LIVE_ENABLE unset until ready
 uv run polymaker capital-check --bankroll 25
-uv run polymaker doctor
+uv run polymaker doctor       # auth/WS preflight; does not place
+# when explicitly authorizing live execution:
+#   set LIVE_ENABLE=1 in .env
 uv run polymaker scan
 uv run polymaker markets-add <slug> --profile micro-capital   # or micro-tight
 uv run polymaker run --bankroll 25                            # LIVE only
 uv run polymaker status
-uv run polymaker cancel-all                                   # panic
+uv run polymaker cancel-all                                   # panic (no LIVE_ENABLE needed)
 ```
 
-Optional tiny live plumbing checks (spend little): `livetest`, `moneydoctor`.
+Optional tiny live plumbing checks (spend little; need `LIVE_ENABLE=1`): `livetest`, `moneydoctor`.
 
 ## Honest expectations
 

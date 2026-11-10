@@ -22,9 +22,12 @@ from polymaker.execution.gateway import ExecutionGateway
 
 async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0) -> bool:
     from polymaker.catalog.store import CatalogStore
+    from polymaker.live_gate import LiveGateError, assert_live_place_allowed
 
-    if not cfg.secrets.has_wallet:
-        console.print("[red]No wallet in .env. Set PK and BROWSER_ADDRESS first.[/red]")
+    try:
+        assert_live_place_allowed(cfg)
+    except LiveGateError as exc:
+        console.print(f"[red]{exc}[/red]")
         return False
 
     # pick a liquid market from the catalog (or fall back to a live scan)

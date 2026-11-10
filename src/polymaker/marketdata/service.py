@@ -63,6 +63,11 @@ class MarketDataService:
         # apart on a thin market, so we gate on connection liveness instead.
         self.disconnected_since: float = 0.0
         self._needs_snapshot: set[str] = set()
+        # redacted health counters (no payloads): distinguish cold empty vs drop
+        self.last_message_ts: float = 0.0
+        self.last_snapshot_ts: float = 0.0
+        self.message_count: int = 0
+        self.snapshot_count: int = 0
 
     # ── subscription management ─────────────────────────────────────────
     def set_markets(self, markets: list[tuple[str, list[str]]]) -> None:
@@ -120,6 +125,24 @@ class MarketDataService:
     def ack_snapshot(self, token_id: str) -> None:
         """Mark that an authoritative book snapshot has been applied."""
         self._needs_snapshot.discard(token_id)
+
+    def health_market_state(self) -> str:
+        """Classify market-feed health for local records.
+
+        Cold/empty books on a live connection are ``cold_empty``, never
+        ``disconnected``. Snapshot vs message distinguish feed activity.
+        """
+        if not self.connected:
+            return "disconnected"
+        if self.last_snapshot_ts > 0.0 and self.last_snapshot_ts + 1e-9 >= self.last_message_ts:
+            return "snapshot"
+        if self.last_message_ts > 0.0:
+            return "message"
+        # connected but quiet / no depth yet — not a disconnect
+        any_depth = any(bool(b.bids or b.asks) for b in self.books.values())
+        if not any_depth:
+            return "cold_empty"
+        return "connected"
 
     def clear_books(self) -> None:
         """Drop cached depth and require a fresh snapshot before quoting."""
@@ -181,6 +204,8 @@ class MarketDataService:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return
+        self.last_message_ts = time.time()
+        self.message_count += 1
         for msg in data if isinstance(data, list) else [data]:
             if not isinstance(msg, dict):
                 continue
@@ -206,6 +231,8 @@ class MarketDataService:
             book.set_tick_size(upd.tick_size)
         book.apply_snapshot(upd.bids, upd.asks, upd.ts, upd.book_hash)
         self.ack_snapshot(upd.asset_id)
+        self.last_snapshot_ts = time.time()
+        self.snapshot_count += 1
         self._journal_write("book", msg, upd.ts)
         self._wake(upd.asset_id)
 

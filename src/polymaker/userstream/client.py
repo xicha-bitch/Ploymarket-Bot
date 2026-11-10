@@ -52,6 +52,8 @@ class UserStream:
         self.connected: bool = False
         self.disconnected_since: float = time.time()
         self._ever_connected = False
+        self.last_message_ts: float = 0.0
+        self.message_count: int = 0
 
     def set_markets(self, condition_ids: list[str]) -> None:
         self._markets = condition_ids
@@ -109,6 +111,8 @@ class UserStream:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return
+        self.last_message_ts = time.time()
+        self.message_count += 1
         for msg in data if isinstance(data, list) else [data]:
             if not isinstance(msg, dict):
                 continue

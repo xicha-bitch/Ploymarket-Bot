@@ -22,7 +22,11 @@ from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side, TargetQuotes
 from polymaker.execution.batch import chunk_quotes
-from polymaker.execution.gateway import ExecutionGateway, PositionsReadError
+from polymaker.execution.gateway import (
+    ExecutionGateway,
+    OpenOrdersReadError,
+    PositionsReadError,
+)
 from polymaker.execution.intent import (
     PlacementIntent,
     PlacementIntentStore,
@@ -112,6 +116,13 @@ class Engine:
         self._restart_backoff_s: dict[str, float] = {}
         self._last_budget_skip: dict[str, tuple[str, ...]] = {}
         self._entry_blocked_infeasible: dict[str, bool] = {}
+        # positions Data-API recovery: honor Retry-After / exponential backoff
+        self._positions_fail_streak: int = 0
+        self._positions_backoff_until: float = 0.0
+        self._positions_healthy: bool = True
+        self._last_heartbeat_ok_ts: float = 0.0
+        self._last_reconcile_ok_ts: float = 0.0
+        self._last_reconcile_fail_ts: float = 0.0
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -877,7 +888,15 @@ class Engine:
 
     async def _refresh_token_orders(self, meta: MarketMeta, grace_s: float = 0.0) -> None:
         """Open-orders resync for one market's tokens (grace_s=0 = authoritative)."""
-        live = await self.gateway.open_orders()
+        try:
+            live = await self.gateway.open_orders()
+        except OpenOrdersReadError as exc:
+            log.warning(
+                "refresh_open_orders_failed",
+                cid=meta.condition_id[:8],
+                err=str(exc)[:160],
+            )
+            return
         for tok in (meta.yes.token_id, meta.no.token_id):
             self.state.replace_open_orders(
                 tok, [o for o in live if o.token_id == tok], grace_s=grace_s
@@ -914,6 +933,8 @@ class Engine:
         halt_after = self.cfg.risk.heartbeat_halt_failures
         while self._running:
             ok = await self.gateway.heartbeat()
+            if ok:
+                self._last_heartbeat_ok_ts = time.time()
             if not ok and self.gateway.heartbeat_failures >= halt_after and not self._hb_was_down:
                 # exchange is (or soon will be) auto-cancelling everything we
                 # have live; recompute will see hb_blind and pull quotes
@@ -932,6 +953,60 @@ class Engine:
                 self._wake_all()
             await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
 
+    def _positions_backoff_delay_s(self, exc: PositionsReadError) -> float:
+        """Retry-After when present; else exponential cap. No busy-loop."""
+        if exc.retry_after_s is not None and exc.retry_after_s > 0:
+            return min(float(exc.retry_after_s), 120.0)
+        streak = max(1, self._positions_fail_streak)
+        return min(2.0 ** streak, 60.0)
+
+    def _record_health_snapshot(self, *, reconcile: str) -> None:
+        """Persist one redacted local health row (acceptance evidence)."""
+        hb = "ok" if self._last_heartbeat_ok_ts > 0 else "unknown"
+        if self.cfg.engine.heartbeat and self._last_heartbeat_ok_ts <= 0:
+            hb = "pending"
+        market = "unknown"
+        with contextlib.suppress(Exception):
+            market = self.md.health_market_state()
+        user_state = "unknown"
+        if self.user is None:
+            user_state = "disabled"
+        elif self.user.connected:
+            user_state = "connected"
+        elif self.user.disconnected_since > 0:
+            user_state = "disconnected"
+        tg = "disabled"
+        if self.telegram.enabled:
+            if self.telegram.last_poll_ok_ts > 0:
+                tg = "ok"
+            elif self.telegram.poll_error_count > 0:
+                tg = "error"
+            else:
+                tg = "pending"
+        detail = {
+            "hb_age_s": (
+                round(time.time() - self._last_heartbeat_ok_ts, 3)
+                if self._last_heartbeat_ok_ts > 0
+                else None
+            ),
+            "market_msgs": int(getattr(self.md, "message_count", 0)),
+            "market_snaps": int(getattr(self.md, "snapshot_count", 0)),
+            "user_msgs": int(getattr(self.user, "message_count", 0) or 0) if self.user else 0,
+            "tg_polls": int(self.telegram.poll_ok_count),
+            "pos_streak": int(self._positions_fail_streak),
+            "pos_healthy": bool(self._positions_healthy),
+            "orders_n": len(self.state.orders),
+            "pos_n": sum(1 for p in self.state.positions.values() if p.size > 0),
+        }
+        self.state.record_health(
+            heartbeat=hb,
+            market=market,
+            user_stream=user_state,
+            telegram_poll=tg,
+            reconcile=reconcile,
+            detail=detail,
+        )
+
     async def _reconcile_loop(self) -> None:
         rounds = 0
         while self._running:
@@ -945,6 +1020,7 @@ class Engine:
             forced = self._reconcile_now.is_set()
             self._reconcile_now.clear()
             rounds += 1
+            reconcile_status = "ok"
             try:
                 # a MATCHED whose settlement event was lost would block a token's
                 # reconciliation forever — expire stale in-flight guards first
@@ -953,38 +1029,87 @@ class Engine:
                     self.alerter.alert("inflight_expired",
                                        f"{len(expired)} stuck in-flight guards cleared")
 
-                try:
-                    positions = self._only_traded(await self.gateway.positions())
-                except PositionsReadError as exc:
-                    # Keep prior local inventory; never interpret failed read as flat.
-                    log.warning("reconcile_positions_failed", err=str(exc))
+                positions: dict[str, tuple[float, float]] | None
+                now_mono = time.monotonic()
+                if now_mono < self._positions_backoff_until:
+                    # Still cooling down after 429/fail — keep local inventory,
+                    # do not hammer Data API.
+                    remaining = self._positions_backoff_until - now_mono
+                    log.info(
+                        "positions_backoff_skip",
+                        remaining_s=round(remaining, 2),
+                        streak=self._positions_fail_streak,
+                    )
                     positions = None
+                    reconcile_status = "backoff"
+                else:
+                    try:
+                        positions = self._only_traded(await self.gateway.positions())
+                    except PositionsReadError as exc:
+                        # Keep prior local inventory; never interpret failed read as flat.
+                        self._positions_fail_streak += 1
+                        self._positions_healthy = False
+                        delay = self._positions_backoff_delay_s(exc)
+                        self._positions_backoff_until = time.monotonic() + delay
+                        self._last_reconcile_fail_ts = time.time()
+                        log.warning(
+                            "reconcile_positions_failed",
+                            err=str(exc),
+                            status=exc.status_code,
+                            retry_after_s=exc.retry_after_s,
+                            backoff_s=round(delay, 2),
+                            streak=self._positions_fail_streak,
+                        )
+                        positions = None
+                        reconcile_status = "fail"
+                    else:
+                        was_unhealthy = not self._positions_healthy
+                        self._positions_fail_streak = 0
+                        self._positions_backoff_until = 0.0
+                        self._positions_healthy = True
+                        self._last_reconcile_ok_ts = time.time()
+                        if was_unhealthy:
+                            log.info("positions_reconcile_recovered")
+                            # Resume normal cadence; wake quoters so exits refresh.
+                            self._wake_all()
                 if positions is not None:
                     # Empty dict is a valid complete snapshot and must zero stale locals.
                     self.state.reconcile_positions(positions, is_snapshot=True)
-                live = await self.gateway.open_orders()
-                by_token: dict[str, list[Any]] = {}
-                for o in live:
-                    by_token.setdefault(o.token_id, []).append(o)
-                # iterate ALL our tokens, not just those in the REST response — a
-                # token whose orders vanished server-side must be cleaned up too.
-                # Hold the market lock so we don't race the quoter mid-flight.
-                for cid, meta in self.metas.items():
-                    lock = self._locks.get(cid)
-                    if lock is None:
-                        continue
-                    async with lock:
-                        for tok in (meta.yes.token_id, meta.no.token_id):
-                            if self.state.inflight(tok) == 0:
-                                self.state.replace_open_orders(tok, by_token.get(tok, []))
+
+                live: list[Any] | None
+                try:
+                    live = await self.gateway.open_orders()
+                except OpenOrdersReadError as exc:
+                    # Fail-open on order book: keep local resting view; exit status
+                    # path treats this as unknown rather than "confirmed none".
+                    log.warning("reconcile_open_orders_failed", err=str(exc)[:160])
+                    live = None
+                    if reconcile_status == "ok":
+                        reconcile_status = "orders_fail"
+                if live is not None:
+                    by_token: dict[str, list[Any]] = {}
+                    for o in live:
+                        by_token.setdefault(o.token_id, []).append(o)
+                    # iterate ALL our tokens, not just those in the REST response — a
+                    # token whose orders vanished server-side must be cleaned up too.
+                    # Hold the market lock so we don't race the quoter mid-flight.
+                    for cid, meta in self.metas.items():
+                        lock = self._locks.get(cid)
+                        if lock is None:
+                            continue
+                        async with lock:
+                            for tok in (meta.yes.token_id, meta.no.token_id):
+                                if self.state.inflight(tok) == 0:
+                                    self.state.replace_open_orders(tok, by_token.get(tok, []))
                 if forced:
                     log.info(
                         "forced_reconcile_done",
                         positions=("failed" if positions is None else len(positions)),
-                        open_orders=len(live),
+                        open_orders=("failed" if live is None else len(live)),
                     )
                     self._wake_all()
             except Exception as exc:  # noqa: BLE001
+                reconcile_status = "error"
                 log.warning("reconcile_error", err=str(exc))
             # slower loops: on-chain position divergence + pnl snapshot + WAL
             if rounds % 4 == 0:
@@ -992,6 +1117,8 @@ class Engine:
                     await self._check_position_divergence()
             self.state.record_pnl(self.risk.equity, self.risk.net_cash,
                                   self.risk.inventory_value, self.risk.daily_pnl)
+            with contextlib.suppress(Exception):
+                self._record_health_snapshot(reconcile=reconcile_status)
             if rounds % 20 == 0:
                 self.state.checkpoint_wal()
 
@@ -1126,17 +1253,36 @@ class Engine:
         blocked = any(self._entry_blocked_infeasible.values()) if self._entry_blocked_infeasible else None
         one_sided = False
         held_sides = 0
+        held_tokens: set[str] = set()
         for meta in self.metas.values():
             yes_held = self.state.position(meta.yes.token_id).size >= meta.min_order_size
             no_held = self.state.position(meta.no.token_id).size >= meta.min_order_size
             if yes_held:
                 held_sides += 1
+                held_tokens.add(meta.yes.token_id)
             if no_held:
                 held_sides += 1
+                held_tokens.add(meta.no.token_id)
         if held_sides == 1:
             one_sided = True
         elif held_sides == 0:
             one_sided = False
+        # Code may allow exit quoting whenever we hold inventory; that is NOT
+        # the same as exchange confirming a resting SELL.
+        exit_quoting_allowed = held_sides > 0
+        exit_order_status: str
+        exit_sell_count: int | None
+        try:
+            live_orders = await self.gateway.open_orders()
+        except OpenOrdersReadError:
+            exit_order_status = "unknown"
+            exit_sell_count = None
+        else:
+            sells = [o for o in live_orders if o.side is Side.SELL and o.size > 0]
+            if held_tokens:
+                sells = [o for o in sells if o.token_id in held_tokens]
+            exit_sell_count = len(sells)
+            exit_order_status = "resting" if exit_sell_count > 0 else "none"
         return format_status_report(
             markets=len(self.metas),
             open_orders=n_orders,
@@ -1150,7 +1296,9 @@ class Engine:
             positions=positions,
             entry_blocked_infeasible=blocked,
             one_sided_inventory=one_sided,
-            exit_path_retained=True,
+            exit_quoting_allowed=exit_quoting_allowed,
+            exit_order_status=exit_order_status,  # type: ignore[arg-type]
+            exit_sell_count=exit_sell_count,
         )
 
     def _telegram_pnl_text(self) -> str:

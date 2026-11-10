@@ -106,8 +106,15 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
         console.print(f"  [dim]· routing via proxy {cfg.proxy.split('@')[-1]}[/dim]")
 
     # ── live market WS: receive an actual book frame ────────────────────
-    token = held_tokens[0] if held_tokens else await _top_political_token(cfg)
+    # Prefer an *active* market token. Held inventory is often REDEEMABLE /
+    # settled (current_price=0) and never emits a book frame — that used to
+    # make doctor falsely NOT READY after a successful wallet+positions read.
+    live_token = await _configured_market_token(cfg) or await _top_political_token(cfg)
+    token = _select_ws_probe_token(held_tokens, live_token)
     if token:
+        if live_token and token == live_token:
+            console.print("  [dim]· market WS probe token: active market "
+                          "(not redeemable inventory)[/dim]")
         passed, detail = await _market_ws_book(token, cfg.proxy)
         check("market WS live book frame", passed, detail)
     else:
@@ -171,6 +178,38 @@ async def _user_ws_auth(creds: Any, markets: list[str], proxy: str | None = None
         return False, "connection closed (auth likely rejected)"
     except Exception as e:  # noqa: BLE001
         return False, str(e)[:80]
+
+
+def _select_ws_probe_token(held_tokens: list[str], live_token: str | None) -> str | None:
+    """Choose a token for the market-WS book probe.
+
+    Live/active market tokens first; held inventory only as last resort
+    (redeemable/settled positions often have no book and time out).
+    """
+    if live_token:
+        return live_token
+    return held_tokens[0] if held_tokens else None
+
+
+async def _configured_market_token(cfg: Config) -> str | None:
+    """Resolve a CLOB token from the first enabled configured market slug."""
+    entry = next((m for m in cfg.markets if m.enabled and m.slug), None)
+    if entry is None or not entry.slug:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                f"{cfg.wallet.gamma_host}/markets",
+                params={"slug": entry.slug},
+            )
+            data = r.json()
+            m = data[0] if isinstance(data, list) and data else data
+            if not isinstance(m, dict) or m.get("closed"):
+                return None
+            toks = json.loads(m.get("clobTokenIds") or "[]")
+            return str(toks[0]) if toks else None
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 async def _top_political_token(cfg: Config) -> str | None:

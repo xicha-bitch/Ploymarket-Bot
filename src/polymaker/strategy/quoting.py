@@ -105,7 +105,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     regime_scale = 0.5 if inp.regime == Regime.TRENDING else 1.0
     tox_scale = 1.0 / (1.0 + inp.toxicity * 10.0)
     common_scale = regime_scale * tox_scale * _clamp(inp.risk_size_scale, 0.0, 1.0)
-    # thin/gappy books → min reward size only (adverse selection defense)
+    # thin/gappy books → exchange-min only (rewards size is soft, not hard)
     yes_book_scale = size_scale_for_book(
         inp.yes_view, tick=tick, rewards_min_size=m.rewards_min_size, profile=p
     )
@@ -213,25 +213,26 @@ def _add_layers(
 ) -> None:
     """Split size across `layers` price levels stepping away from the touch.
 
-    Each ORDER must meet the exchange min and, when within reach (>=50% of it),
-    is bumped to `reward_floor` (the reward min-size × the profile margin) so it
-    actually scores — the program scores per order, so a floor applied to the
-    total is worthless. Layers that can't reach the floor are consolidated into
-    fewer, larger orders rather than resting unscoring dust.
+    Hard rule: every resting order must meet ``exchange_min``. Soft rule: when
+    a layer is already within reach of the rewards scoring size
+    (``reward_floor`` = rewardsMinSize × mult), bump it up so it scores —
+    but **never** treat rewards size as a hard floor that inflates exchange-min
+    dust (that previously turned 5-share micro quotes into 200-share rejects).
     """
     if total_size <= 0:
         return
     layers = max(1, layers)
-    reward_floor = max(reward_floor, exchange_min)
+    hard_min = max(0.0, exchange_min)
+    reward_target = max(0.0, reward_floor)  # soft scoring target; may be 0
     per = round(total_size / layers, 2)
-    # consolidate: if a split layer would fall below half the reward floor,
-    # use fewer layers so each resting order can still score
-    while layers > 1 and reward_floor > 0 and per < 0.5 * reward_floor:
+    # consolidate so each layer can meet the *exchange* min (hard)
+    while layers > 1 and hard_min > 0 and per < hard_min:
         layers -= 1
         per = round(total_size / layers, 2)
-    if reward_floor > 0 and 0.5 * reward_floor <= per < reward_floor:
-        per = reward_floor  # bump each order up to scoring size
-    if per < exchange_min or per <= 0:
+    # soft reward bump only when already near the scoring size
+    if reward_target > hard_min and 0.5 * reward_target <= per < reward_target:
+        per = reward_target
+    if per < hard_min or per <= 0:
         return
     for i in range(layers):
         offset = i * step_ticks * tick

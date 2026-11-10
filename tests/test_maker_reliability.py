@@ -75,16 +75,21 @@ def test_should_min_size_only_connected_thin_silent(profile):
     )
 
 
-def test_thin_book_clamps_quote_size(meta, profile):
+def test_thin_book_clamps_to_exchange_min_not_rewards(meta, profile):
+    """Thin/gappy → exchange min only; must NOT inflate to rewardsMinSize."""
+    # Force a rewards floor far above exchange min (live failure mode: 200 vs 5).
+    from dataclasses import replace
+
+    fat_rewards = replace(meta, rewards_min_size=200.0)
     deep = construct_quotes(
         QuoteInputs(
-            meta=meta,
+            meta=fat_rewards,
             regime=Regime.QUIET,
             fv=0.50,
             vol_short=0.0,
             toxicity=0.0,
-            yes_view=view(0.49, 0.51, 500, 500),
-            no_view=view(0.49, 0.51, 500, 500),
+            yes_view=view(0.49, 0.51, 5000, 5000),
+            no_view=view(0.49, 0.51, 5000, 5000),
             pos_yes=Position("yes-token"),
             pos_no=Position("no-token"),
             profile=profile,
@@ -93,7 +98,7 @@ def test_thin_book_clamps_quote_size(meta, profile):
     )
     thin = construct_quotes(
         QuoteInputs(
-            meta=meta,
+            meta=fat_rewards,
             regime=Regime.QUIET,
             fv=0.50,
             vol_short=0.0,
@@ -106,11 +111,15 @@ def test_thin_book_clamps_quote_size(meta, profile):
             now=1.0,
         )
     )
-    deep_sz = max(q.size for q in deep.quotes if q.side is Side.BUY)
-    thin_sz = max(q.size for q in thin.quotes if q.side is Side.BUY)
-    floor = meta.rewards_min_size * profile.reward_size_mult
-    assert thin_sz <= floor + 1e-9
-    assert deep_sz >= thin_sz
+    thin_buys = [q for q in thin.quotes if q.side is Side.BUY]
+    assert thin_buys, "thin book should still quote at exchange min"
+    thin_sz = max(q.size for q in thin_buys)
+    assert thin_sz == fat_rewards.min_order_size
+    assert thin_sz < fat_rewards.rewards_min_size * profile.reward_size_mult
+    deep_buys = [q for q in deep.quotes if q.side is Side.BUY]
+    if deep_buys:
+        deep_sz = max(q.size for q in deep_buys)
+        assert deep_sz >= thin_sz
 
 
 def test_chunk_quotes_respects_batch_cap():

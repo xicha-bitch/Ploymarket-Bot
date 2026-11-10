@@ -178,16 +178,21 @@ def test_untracked_positions_are_dropped_and_filtered(tmp_path, meta):
     eng.catalog.close()
 
 
-def test_per_layer_reward_floor(meta, profile):
-    """Every resting ORDER must meet the rewards min size (scoring is per order).
-    NO at ~0.80 with $100 base -> layers bump to the 100-share floor."""
+def test_per_layer_reward_soft_target_on_deep_book(meta, profile):
+    """On a deep book, layers near the rewards scoring size may soft-bump to it.
+
+    Rewards min is NOT a hard floor on thin books (that caused micro-wallet
+    rejects). Deep books + large base_size still score when already near target.
+    """
     from dataclasses import replace
 
     m = replace(meta, rewards_min_size=100.0)
     p = profile.with_overrides({"base_size_usdc": 100.0, "layers": 2})
+    # Depth >> rewards_min * thin_depth_mult so scale=1 (not thin clamp).
     tq = construct_quotes(QuoteInputs(
         meta=m, regime=Regime.QUIET, fv=0.20, vol_short=0.0, toxicity=0.0,
-        yes_view=view(0.195, 0.197), no_view=view(0.802, 0.805),
+        yes_view=view(0.195, 0.197, 5000, 5000),
+        no_view=view(0.802, 0.805, 5000, 5000),
         pos_yes=Position("yes-token"), pos_no=Position("no-token"),
         profile=p, now=1000.0,
     ))

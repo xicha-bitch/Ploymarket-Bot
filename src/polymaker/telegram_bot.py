@@ -241,7 +241,7 @@ class TelegramBot:
         if not self.enabled:
             log.info("telegram_smoke_skipped", reason="not_configured")
             return False
-        mid = await self.send("bot linked")
+        mid = await self.send("机器人已连通")
         ok = mid is not None
         log.info("telegram_smoke", ok=ok, blocked=self._chat_block_reason or None)
         return ok
@@ -265,17 +265,18 @@ class TelegramBot:
         if not self.push_fills:
             return
         notional = price * size
-        tid = f" id={trade_id[:12]}" if trade_id else ""
+        side_zh = "买入" if side.upper() == "BUY" else ("卖出" if side.upper() == "SELL" else side)
+        tid = f" 成交号={trade_id[:12]}" if trade_id else ""
         await self.send(
-            f"✅ FILL {side} {size:.2f} @ {price:.3f} (~${notional:.2f}) "
-            f"tok={token_hint}{tid}"
+            f"✅ 成交 {side_zh} {size:.4f} 份 @ {price:.4f} pUSD/份"
+            f"（约 {notional:.4f} pUSD）代币={token_hint}{tid}"
         )
 
     async def notify_place_failed(self, *, n: int, detail: str = "") -> None:
         if not self.push_place_events:
             return
         extra = f" — {detail[:200]}" if detail else ""
-        await self.send(f"❌ PLACE FAILED ({n} quotes){extra}")
+        await self.send(f"❌ 下单失败（{n} 笔报价）{extra}")
 
     async def notify_status(self, text: str) -> None:
         if not self.push_periodic:
@@ -292,14 +293,14 @@ class TelegramBot:
             return False, ""
         today = date.today().isoformat()
         if self._confirm_day != today:
-            return True, f"first place of day ({today}), ~${place_notional:.2f}"
+            return True, f"当日首次下单（{today}），约 {place_notional:.2f} pUSD"
         # size bump: >25% above today's max and at least +$1 notional
         if (
             place_notional > self._max_day_notional * 1.25
             and place_notional > self._max_day_notional + 1.0
         ):
             return True, (
-                f"size increase ${self._max_day_notional:.2f} → ${place_notional:.2f}"
+                f"下单名义放大 {self._max_day_notional:.2f} → {place_notional:.2f} pUSD"
             )
         return False, ""
 
@@ -329,14 +330,14 @@ class TelegramBot:
         self._pending[req_id] = fut
         markup = {
             "inline_keyboard": [[
-                {"text": "✅ Approve", "callback_data": f"ok:{req_id}"},
-                {"text": "🚫 Deny", "callback_data": f"no:{req_id}"},
+                {"text": "✅ 批准", "callback_data": f"ok:{req_id}"},
+                {"text": "🚫 拒绝", "callback_data": f"no:{req_id}"},
             ]],
         }
-        body = f"⚠️ CONFIRM required\n{reason}"
+        body = f"⚠️ 需要确认\n{reason}"
         if detail:
             body += f"\n{detail}"
-        body += f"\n(timeout {int(self._confirm_timeout_s)}s)"
+        body += f"\n（{int(self._confirm_timeout_s)} 秒内有效）"
         mid = await self.send(body, reply_markup=markup)
         if mid is None:
             self._pending.pop(req_id, None)
@@ -349,7 +350,7 @@ class TelegramBot:
             with contextlib.suppress(asyncio.InvalidStateError):
                 if not fut.done():
                     fut.set_result(False)
-            await self.send(f"⏳ confirm timed out — trade skipped ({req_id})")
+            await self.send(f"⏳ 确认超时 — 已跳过本次下单（{req_id}）")
             return False
         finally:
             self._pending.pop(req_id, None)
@@ -400,7 +401,7 @@ class TelegramBot:
                     break
                 text = await self._call_provider(self._status_provider)
                 if text:
-                    await self.notify_status(f"⏱ periodic status\n{text}")
+                    await self.notify_status(f"⏱ 定时状态\n{text}")
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
@@ -432,7 +433,10 @@ class TelegramBot:
         chat = ((cq.get("message") or {}).get("chat") or {}).get("id")
         if not self._secrets or str(chat) != str(self._secrets.chat_id):
             if cq_id:
-                await self._api("answerCallbackQuery", {"callback_query_id": cq_id, "text": "ignored"})
+                await self._api(
+                    "answerCallbackQuery",
+                    {"callback_query_id": cq_id, "text": "已忽略"},
+                )
             return
         approved = data.startswith("ok:")
         denied = data.startswith("no:")
@@ -442,9 +446,12 @@ class TelegramBot:
             if cq_id:
                 await self._api(
                     "answerCallbackQuery",
-                    {"callback_query_id": cq_id, "text": "approved" if approved else "denied"},
+                    {
+                        "callback_query_id": cq_id,
+                        "text": "已批准" if approved else "已拒绝",
+                    },
                 )
-            await self.send("✅ approved" if approved else "🚫 denied")
+            await self.send("✅ 已批准" if approved else "🚫 已拒绝")
             return
         if cq_id:
             await self._api("answerCallbackQuery", {"callback_query_id": cq_id})
@@ -452,15 +459,15 @@ class TelegramBot:
     @staticmethod
     def _help_text() -> str:
         return (
-            "你好，我是 Polymarket 交易通知 bot。\n\n"
+            "你好，我是 Polymarket 交易通知机器人。\n\n"
             "命令：\n"
-            "/status — 余额 / 挂单 / 仓位 / 成交 / PnL\n"
-            "/pnl — 权益 / 当日 PnL\n"
+            "/status — 余额、挂单、仓位、成交、会话记账\n"
+            "/pnl — 会话记账（非正式账户总资产）\n"
             "/stop — 暂停新下单（不批量撤单）\n"
             "/help — 本说明\n\n"
             "也可发「hi」「在吗」「跟我聊天」测连通；"
             "不查天气，交易状态请用 /status。\n\n"
-            "默认安静：不推送周期状态/下单噪音。"
+            "默认安静：不主动推送周期状态或下单噪音。"
             "需要成交推送时设 TELEGRAM_NOTIFY=fills。"
         )
 
@@ -485,11 +492,11 @@ class TelegramBot:
             if cmd in ("/start", "/help"):
                 await self.send(self._help_text())
             elif cmd == "/status":
-                body = await self._call_provider(self._status_provider) or "(暂无状态数据)"
+                body = await self._call_provider(self._status_provider) or "暂无状态数据（读取失败）"
                 await self.send(f"📊 状态\n{body}")
             elif cmd == "/pnl":
-                body = await self._call_provider(self._pnl_provider) or "(暂无 PnL 数据)"
-                await self.send(f"📈 PnL\n{body}")
+                body = await self._call_provider(self._pnl_provider) or "暂无会话记账数据（读取失败）"
+                await self.send(f"📈 会话记账\n{body}")
             elif cmd == "/stop":
                 self.stop_requested = True
                 await self.send("🛑 已请求停止 — 暂停新下单（挂单保留，不批量撤单）")
@@ -504,11 +511,11 @@ class TelegramBot:
         norm = self._normalize_chat_text(text)
         if norm in ("hi", "hello", "hey", "在吗", "在么", "在不在", "跟我聊天", "聊天"):
             await self.send(
-                "在的 🙂 我是交易通知 bot，不是闲聊助手。"
+                "在的 🙂 我是交易通知机器人，不是闲聊助手。"
                 "要看交易状态发 /status，更多命令 /help。"
             )
         elif "天气" in norm:
-            await self.send("我不会查天气～这是交易通知 bot。看交易状态请发 /status。")
+            await self.send("我不会查天气～这是交易通知机器人。看交易状态请发 /status。")
         else:
             await self.send("没听懂。试试 /help，或发 /status 看交易状态。")
 

@@ -20,8 +20,14 @@ from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
-from polymaker.domain import Fill, MarketMeta, Regime, Side
+from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side
+from polymaker.execution.batch import chunk_quotes
 from polymaker.execution.gateway import ExecutionGateway
+from polymaker.execution.intent import (
+    PlacementIntent,
+    PlacementIntentStore,
+    client_key_for,
+)
 from polymaker.execution.reconciler import reconcile
 from polymaker.journal import Journal
 from polymaker.logging import get_logger
@@ -37,6 +43,7 @@ from polymaker.strategy.estimators import (
     MarkoutTracker,
     VolEstimator,
 )
+from polymaker.strategy.maker_gates import compute_exit_urgency
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
@@ -75,6 +82,9 @@ class Engine:
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+        # inventory open timestamps for exit urgency (token_id -> first non-flat ts)
+        self._inv_open_ts: dict[str, float] = {}
+        self._intents = PlacementIntentStore()
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -310,6 +320,25 @@ class Engine:
         fv = est.last_fv if est.last_fv is not None else fill.price
         token_fv = fv if fill.token_id == self.metas[cid].yes.token_id else (1.0 - fv)
         est.markout.record_fill(fill.side, token_fv, fill.ts)
+        # track inventory open time for exit urgency (BUY opens / adds; flat clears)
+        pos = self.state.position(fill.token_id)
+        if pos.size >= self.metas[cid].min_order_size:
+            self._inv_open_ts.setdefault(fill.token_id, fill.ts)
+        else:
+            self._inv_open_ts.pop(fill.token_id, None)
+
+    def _exit_urgency_for(
+        self, token_id: str, pos_avg: float, token_fv: float, profile: StrategyProfile, now: float
+    ) -> float:
+        open_ts = self._inv_open_ts.get(token_id)
+        if open_ts is None:
+            return 0.0
+        held_s = max(0.0, now - open_ts)
+        # long inventory is adverse when mark < avg entry
+        adverse = max(0.0, pos_avg - token_fv) if pos_avg > 0 else 0.0
+        return compute_exit_urgency(
+            held_s=held_s, adverse=adverse, exit_urgency_s=profile.exit_urgency_s
+        )
 
     # ── quoter ──────────────────────────────────────────────────────────
     async def _quoter(self, cid: str) -> None:
@@ -440,12 +469,28 @@ class Engine:
             p,
         )
 
+        # keep inv-open clocks in sync even when fills arrived via REST reconcile
+        for tok, pos in ((meta.yes.token_id, pos_yes), (meta.no.token_id, pos_no)):
+            if pos.size >= meta.min_order_size:
+                self._inv_open_ts.setdefault(tok, now)
+            else:
+                self._inv_open_ts.pop(tok, None)
+
+        yes_u = self._exit_urgency_for(meta.yes.token_id, pos_yes.avg_price, fv, p, now)
+        no_u = self._exit_urgency_for(
+            meta.no.token_id, pos_no.avg_price, 1.0 - fv, p, now
+        )
+        # soft advisory: worst-case filled+resting vs cap (does not replace hard rd)
+        adv_scale = self.risk.advisory_size_scale(meta)
+        size_scale = min(rd.size_scale, adv_scale) if adv_scale < 1.0 else rd.size_scale
+
         tq = construct_quotes(QuoteInputs(
             meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
             toxicity=est.markout.toxicity, yes_view=yes_book.view(),
             no_view=(no_book.view() if no_book else _empty_view()),
             pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
-            risk_size_scale=rd.size_scale,
+            risk_size_scale=size_scale,
+            yes_exit_urgency=yes_u, no_exit_urgency=no_u,
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
@@ -479,7 +524,7 @@ class Engine:
                 log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                 self._dirty[cid].set()  # retry soon
             else:
-                placed = await self.gateway.place(plan.to_place, meta)
+                placed = await self._place_with_intent(cid, meta, plan.to_place)
                 placed_n = len(placed)
                 self.risk.note_order_result(len(placed) == len(plan.to_place))
                 for o in placed:
@@ -493,12 +538,45 @@ class Engine:
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),
                  pos_yes=round(pos_yes.size, 1), pos_no=round(pos_no.size, 1),
-                 tox=round(est.markout.toxicity, 3), flowz=round(est.flow.z, 2))
+                 tox=round(est.markout.toxicity, 3), flowz=round(est.flow.z, 2),
+                 yes_exit_u=round(yes_u, 2), no_exit_u=round(no_u, 2))
         self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
+
+    async def _place_with_intent(
+        self, cid: str, meta: MarketMeta, quotes: list[Quote]
+    ) -> list[OpenOrder]:
+        """Place in max_orders_per_batch chunks; ledger unknown/partial → quarantine."""
+        key = client_key_for(
+            cid, [(q.token_id, q.side.value, q.price, q.size) for q in quotes]
+        )
+        self._intents.record(
+            PlacementIntent(client_key=key, condition_id=cid, n_quotes=len(quotes))
+        )
+        placed_all: list[OpenOrder] = []
+        batches = chunk_quotes(list(quotes), self.cfg.execution.max_orders_per_batch)
+        try:
+            for batch in batches:
+                batch_placed = await self.gateway.place(batch, meta)
+                placed_all.extend(batch_placed)
+                if len(batch_placed) < len(batch):
+                    self._intents.ack(key, [o.order_id for o in placed_all])
+                    self._intents.mark_unknown(key)
+                    break
+            else:
+                self._intents.ack(key, [o.order_id for o in placed_all])
+        except Exception:  # noqa: BLE001 — quarantine path; gateway usually swallows
+            self._intents.mark_unknown(key)
+            raise
+        if self._intents.should_quarantine(key):
+            self._intents.mark_quarantined(key)
+        else:
+            self._intents.clear(key)
+        return placed_all
 
     async def _quarantine(self, meta: MarketMeta, reason: str) -> None:
         """Cancel all orders on a market's tokens and resync state from REST."""
         log.warning("quarantine", cid=meta.condition_id[:8], reason=reason)
+        self._intents.clear_condition(meta.condition_id)
         for tok in (meta.yes.token_id, meta.no.token_id):
             await self.gateway.cancel_asset(tok)
             for o in self.state.orders_for(tok):

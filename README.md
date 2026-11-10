@@ -105,7 +105,10 @@ replay.
 
 ## Strategy
 
-Maker-only, quoting both sides of each market as USDC-collateralized bids:
+Maker-only, quoting both sides of each market as USDC-collateralized bids.
+**Pure MM, not arb:** the YES+NO merge edge `1 − p − q` is a single-venue
+maker-pair exit after both legs fill — **not** cross-venue arbitrage. This
+fork does not claim incomplete multi-venue arb.
 
 - **Fair value** — depth-weighted microprice off the live book, nudged by an
   EWMA of signed trade flow.
@@ -113,7 +116,8 @@ Maker-only, quoting both sides of each market as USDC-collateralized bids:
   half-spread `δ = base + c_vol·σ + c_tox·toxicity`. Post **BUY-YES at `r − δ`**
   and **BUY-NO at `(1 − r) − δ`**. Because both legs are bids that sum below 1,
   a filled pair merges back to USDC at locked edge `1 − p − q` — a maker-only
-  exit that never crosses the spread.
+  exit that never crosses the spread. Thin/gappy books clamp to reward min size;
+  exit urgency rises with hold time / adverse markout.
 - **Inventory skew** — net position leans both quotes: long YES → bid YES lower,
   bid NO higher (acquire the offsetting leg). Size tapers as inventory approaches
   a soft cap, then the adding side is pulled entirely.

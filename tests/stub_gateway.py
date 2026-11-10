@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import itertools
 
-from polymaker.domain import OpenOrder, OrderState, Quote, Side
+from polymaker.domain import OpenOrder, OrderState, Quote
 from polymaker.execution.ratelimit import TokenBucket
 
 

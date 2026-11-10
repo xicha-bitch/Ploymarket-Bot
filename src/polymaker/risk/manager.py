@@ -128,12 +128,35 @@ class RiskManager:
         our own resting BUY orders: those are the quotes we're about to replace,
         and counting them makes the size taper collapse the moment we place a full
         quote (self-reinforcing cancel/replace churn). Worst-case fill is bounded
-        instead by small per-quote sizes + the position cap that this drives."""
+        instead by small per-quote sizes + the position cap that this drives.
+
+        See ``worst_case_market_notional`` for an advisory filled+resting figure
+        (does not drive the hard evaluate() taper — avoids churn)."""
         total = 0.0
         for tok in (meta.yes.token_id, meta.no.token_id):
             pos = self._store.position(tok)
             total += pos.size * self._marks.get(tok, pos.avg_price or 0.5)
         return total
+
+    def worst_case_market_notional(self, meta: MarketMeta) -> float:
+        """Advisory: filled inventory + resting BUY notional if all fills at once.
+
+        Not used for hard REDUCE_ONLY (that would churn); useful for logging /
+        size_scale soft advice and unit tests of micro-cap overshoot risk.
+        """
+        filled = self._market_notional(meta)
+        resting = 0.0
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            for o in self._store.orders_for(tok):
+                if o.side is Side.BUY and o.size > 0:
+                    resting += o.notional
+        return filled + resting
+
+    def advisory_size_scale(self, meta: MarketMeta) -> float:
+        """Soft scale from worst-case filled+resting vs market cap (advisory only)."""
+        return _headroom(
+            self.worst_case_market_notional(meta), self._cfg.max_market_notional_usdc
+        )
 
     def _total_exposure(self) -> float:
         total = 0.0

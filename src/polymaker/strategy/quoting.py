@@ -3,6 +3,12 @@
 This is the deterministic core of the strategy. No I/O, no wall-clock reads
 except values passed in. Everything here is exercised directly by unit tests.
 
+Product boundary — **pure single-venue market making**, not arbitrage:
+  - BUY-YES + BUY-NO merge edge ``1 - p - q`` is a maker-pair exit after both
+    legs fill on Polymarket. It is **not** cross-venue arb and must not be
+    documented or logged as such.
+  - Incomplete multi-venue / copy / sniper paths are out of scope.
+
 Model (see the README):
   reservation  r  = FV - skew(inventory)
   half-spread  δ  = base + c_vol·σ + c_tox·toxicity   (clamped to reward band in QUIET)
@@ -22,6 +28,11 @@ from dataclasses import dataclass
 from polymaker.config import StrategyProfile
 from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQuotes
 from polymaker.marketdata.orderbook import BookView
+from polymaker.strategy.maker_gates import (
+    apply_min_size_clamp,
+    pair_edge_ok,
+    size_scale_for_book,
+)
 
 _EPS = 1e-9
 
@@ -94,29 +105,64 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     regime_scale = 0.5 if inp.regime == Regime.TRENDING else 1.0
     tox_scale = 1.0 / (1.0 + inp.toxicity * 10.0)
     common_scale = regime_scale * tox_scale * _clamp(inp.risk_size_scale, 0.0, 1.0)
+    # thin/gappy books → min reward size only (adverse selection defense)
+    yes_book_scale = size_scale_for_book(
+        inp.yes_view, tick=tick, rewards_min_size=m.rewards_min_size, profile=p
+    )
+    no_book_scale = size_scale_for_book(
+        inp.no_view, tick=tick, rewards_min_size=m.rewards_min_size, profile=p
+    )
 
     soft_cap = p.q_soft_frac  # fraction of q_max at which the adding side pulls
     add_yes = inp.regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
     add_no = inp.regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
 
+    yes_entry: Quote | None = None
+    no_entry: Quote | None = None
+
     # entry: BUY YES
     if add_yes:
         price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
         if price is not None:
+            raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m)
+            sized = apply_min_size_clamp(raw, scale=yes_book_scale, meta=m, profile=p)
+            before = len(quotes)
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
-                        p.layers, p.layer_step_ticks, down=True,
+                        sized, p.layers, p.layer_step_ticks, down=True,
                         exchange_min=m.min_order_size, reward_floor=reward_floor)
+            if len(quotes) > before:
+                yes_entry = quotes[before]  # top-of-book layer
 
     # entry: BUY NO
     if add_no:
         no_fv = 1.0 - inp.fv
         price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
         if price is not None:
+            raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m)
+            sized = apply_min_size_clamp(raw, scale=no_book_scale, meta=m, profile=p)
+            before = len(quotes)
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
-                        p.layers, p.layer_step_ticks, down=True,
+                        sized, p.layers, p.layer_step_ticks, down=True,
                         exchange_min=m.min_order_size, reward_floor=reward_floor)
+            if len(quotes) > before:
+                no_entry = quotes[before]
+
+    # hard pair-cost gate: if both entry tops would leave too little merge edge,
+    # drop the worse (higher) top and its deeper layers on that token
+    if (
+        yes_entry is not None
+        and no_entry is not None
+        and not pair_edge_ok(
+            yes_entry.price, no_entry.price, tick=tick, min_edge_ticks=p.pair_edge_ticks
+        )
+    ):
+        drop_tok = (
+            m.yes.token_id if yes_entry.price >= no_entry.price else m.no.token_id
+        )
+        quotes[:] = [
+            q for q in quotes
+            if not (q.token_id == drop_tok and q.side is Side.BUY)
+        ]
 
     # ── exits: SELL held inventory (maker, never cross) ─────────────────
     _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, inp.yes_view, tick, dec,

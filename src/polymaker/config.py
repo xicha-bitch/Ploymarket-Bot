@@ -97,6 +97,12 @@ class StrategyProfile(BaseModel):
     reprice_ticks: int = 2
     resize_frac: float = 0.15
     min_edge_ticks: int = 1
+    # hard pair-cost gate: require 1 - p - q >= pair_edge_ticks * tick after bids
+    pair_edge_ticks: int = 1
+    # thin/gappy book sizing (TIPS #1): depth < rewards_min * thin_depth_mult
+    # or bid air-gap >= air_gap_ticks → clamp to reward/exchange min size only
+    thin_depth_mult: float = 10.0
+    air_gap_ticks: int = 8
     # regime
     event_cooloff_s: float = 60.0
     event_jump_ticks: int = 8

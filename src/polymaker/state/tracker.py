@@ -101,7 +101,18 @@ class UserEventProcessor:
         if ev.is_cancel or ev.remaining_size <= 0:
             self._store.remove_order(ev.order_id)
         else:
-            state = OrderState.LIVE
+            # Prefer PARTIALLY_FILLED when remaining shrank vs a known prior size;
+            # if we have no prior (first sighting), LIVE unless caller marked size
+            # as already reduced via remaining < a large sentinel — we use the
+            # prior open order's size when present.
+            prior = next(
+                (o for o in self._store.orders_for(ev.token_id) if o.order_id == ev.order_id),
+                None,
+            )
+            if prior is not None and ev.remaining_size + 1e-9 < prior.size or prior is not None and prior.state is OrderState.PARTIALLY_FILLED:
+                state = OrderState.PARTIALLY_FILLED
+            else:
+                state = OrderState.LIVE
             self._store.upsert_order(
                 OpenOrder(ev.order_id, ev.token_id, ev.side, ev.price, ev.remaining_size, state)
             )

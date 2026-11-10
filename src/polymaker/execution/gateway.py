@@ -12,6 +12,7 @@ cancel paths need wallet only so emergency cancel still works when places are ga
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -30,9 +31,75 @@ log = get_logger("execution.gateway")
 
 _T = TypeVar("_T")
 
+# Data API v2 positions pagination (docs: limit max 1000; cursor is authority).
+_POSITIONS_PAGE_LIMIT = 500
+_POSITIONS_MAX_PAGES = 50
+
+
+class PositionsReadError(RuntimeError):
+    """Data-API positions read failed — must NOT be treated as an empty book."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 def _tick_str(tick: float) -> str:
     return f"{tick:g}"
+
+
+def collateral_raw_to_usd(raw: Any) -> float:
+    """CLOB collateral `balance` is always micro-units (6 decimals); always /1e6."""
+    return float(raw) / 1e6
+
+
+def parse_v2_positions_page(body: Any) -> tuple[list[Any], str | None]:
+    """Parse `{data, pagination}` → (rows, next_cursor_or_None).
+
+    Raises PositionsReadError on unexpected shapes. A successful empty page is
+    `data: []` with `next_cursor` null — that is a real zero, not a failure.
+    """
+    if not isinstance(body, dict) or "data" not in body:
+        raise PositionsReadError(
+            "unexpected positions response shape (expected v2 {data, pagination})"
+        )
+    rows = body.get("data")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise PositionsReadError("positions data is not a list")
+    pag = body.get("pagination")
+    if pag is None:
+        pag = {}
+    if not isinstance(pag, dict):
+        raise PositionsReadError("positions pagination is not an object")
+    next_cursor = pag.get("next_cursor")
+    has_more = bool(pag.get("has_more"))
+    if has_more and not next_cursor:
+        raise PositionsReadError("positions page has_more without next_cursor")
+    return rows, str(next_cursor) if has_more and next_cursor else None
+
+
+def map_position_row(row: Any) -> tuple[str, float, float] | None:
+    """Map one Data API position row → (token_id, size, avg_price).
+
+    v2 fields: token_id, current_size, avg_price (shares / USDC, not micro-units).
+    Legacy v1 names (asset/size/avgPrice) accepted only for test fixtures.
+    Dust (size <= 0) is dropped; None means skip, not failure.
+    """
+    if not isinstance(row, dict):
+        return None
+    token = row.get("token_id", row.get("asset"))
+    if token is None or token == "":
+        return None
+    try:
+        size = float(row.get("current_size", row.get("size", 0)))
+        avg = float(row.get("avg_price", row.get("avgPrice", 0)))
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    return str(token), size, avg
 
 
 class ExecutionGateway:
@@ -394,13 +461,12 @@ class ExecutionGateway:
             return None
 
     async def collateral_balance(self) -> float:
-        """pUSD balance (float) on the funder."""
+        """pUSD balance (float) on the funder. CLOB raw is always /1e6 micro-units."""
         ba = await self.balance_allowance()
         for k in ("balance", "collateral", "amount"):
             if isinstance(ba, dict) and k in ba:
                 try:
-                    v = float(ba[k])
-                    return v / 1e6 if v > 1e6 else v
+                    return collateral_raw_to_usd(ba[k])
                 except (ValueError, TypeError):
                     return 0.0
         return 0.0
@@ -475,25 +541,92 @@ class ExecutionGateway:
             return []
 
     async def positions(self) -> dict[str, tuple[float, float]]:
-        """{token_id: (size, avg_price)} from the data API (reconcile use).
+        """{token_id: (size, avg_price)} from Data API v2 (reconcile use).
 
-        Queries the FUNDER (where positions live), not the signer EOA.
+        Queries the FUNDER / proxy wallet (where positions live), not the signer
+        EOA. Uses `GET {data_api_host}/v2/positions` and follows cursor pages.
+
+        A successful empty book returns `{}`. HTTP 410/non-200, bad envelopes,
+        or transport errors raise PositionsReadError — callers must NOT treat
+        that as zero inventory.
         """
         user = self.funder
-        if not user or not user.startswith("0x") or user == "0xPAPER":
-            return {}
+        if not user or not str(user).startswith("0x") or user == "0xPAPER":
+            raise PositionsReadError("no funder address for positions read")
+
+        out: dict[str, tuple[float, float]] = {}
+        cursor: str | None = None
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{self._data_host}/positions", params={"user": user})
-                r.raise_for_status()
-                return {
-                    str(p["asset"]): (float(p["size"]), float(p.get("avgPrice", 0)))
-                    for p in r.json()
-                    if float(p.get("size", 0)) > 0
-                }
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
-            log.warning("positions_failed", err=str(exc))
-            return {}
+                for _page in range(_POSITIONS_MAX_PAGES):
+                    params: dict[str, Any] = {"user": user}
+                    if cursor:
+                        params["cursor"] = cursor
+                    else:
+                        params["limit"] = _POSITIONS_PAGE_LIMIT
+                    url = f"{self._data_host}/v2/positions"
+                    r = await c.get(url, params=params)
+                    if r.status_code != 200:
+                        body = ""
+                        with contextlib.suppress(Exception):
+                            body = (r.text or "")[:180]
+                        log.warning(
+                            "positions_failed",
+                            status=r.status_code,
+                            host=self._data_host,
+                            path="/v2/positions",
+                            # funder prefix only — never full keys/secrets
+                            funder=user[:10],
+                            detail=body,
+                        )
+                        raise PositionsReadError(
+                            f"data-api GET /v2/positions HTTP {r.status_code}: {body}",
+                            status_code=r.status_code,
+                        )
+                    rows, cursor = parse_v2_positions_page(r.json())
+                    for row in rows:
+                        mapped = map_position_row(row)
+                        if mapped is None:
+                            continue
+                        token_id, size, avg = mapped
+                        out[token_id] = (size, avg)
+                    if cursor is None:
+                        return out
+                raise PositionsReadError(
+                    f"positions pagination exceeded {_POSITIONS_MAX_PAGES} pages"
+                )
+        except PositionsReadError:
+            raise
+        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+            log.warning("positions_failed", err=str(exc), funder=user[:10])
+            raise PositionsReadError(f"positions read failed: {exc}") from exc
+
+    async def portfolio_value(self) -> float | None:
+        """Mark-to-market position value (USDC) for the funder via Data API v2.
+
+        `GET /v2/value?user=<funder>`. Returns None on failure (not zero).
+        """
+        user = self.funder
+        if not user or not str(user).startswith("0x") or user == "0xPAPER":
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                r = await c.get(f"{self._data_host}/v2/value", params={"user": user})
+                if r.status_code != 200:
+                    log.warning(
+                        "portfolio_value_failed",
+                        status=r.status_code,
+                        funder=user[:10],
+                    )
+                    return None
+                body = r.json()
+                data = body.get("data") if isinstance(body, dict) else None
+                if not isinstance(data, dict) or "value" not in data:
+                    return None
+                return float(data["value"])
+        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+            log.warning("portfolio_value_failed", err=str(exc), funder=user[:10])
+            return None
 
     async def balance_allowance(self) -> dict[str, Any]:
         """Collateral balance/allowance snapshot (for `doctor`)."""

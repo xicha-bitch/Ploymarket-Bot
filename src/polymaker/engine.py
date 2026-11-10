@@ -22,7 +22,7 @@ from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side
 from polymaker.execution.batch import chunk_quotes
-from polymaker.execution.gateway import ExecutionGateway
+from polymaker.execution.gateway import ExecutionGateway, PositionsReadError
 from polymaker.execution.intent import (
     PlacementIntent,
     PlacementIntentStore,
@@ -250,10 +250,22 @@ class Engine:
         # purge positions that leaked in for markets we don't trade (manual UI
         # bets etc.) so they can't distort exposure caps or PnL
         self.state.drop_untracked_positions(set(self._token_cid))
-        positions = self._only_traded(await self.gateway.positions())
+        try:
+            positions = self._only_traded(await self.gateway.positions())
+        except PositionsReadError as exc:
+            # Fail closed: a 410/transport miss is NOT empty inventory.
+            log.error("startup_positions_failed", err=str(exc))
+            self.alerter.alert(
+                "startup_positions_failed",
+                f"positions read failed (not treating as zero): {exc}",
+                critical=True,
+            )
+            raise
         if positions:
             self.state.reconcile_positions(positions)
             log.info("startup_positions", n=len(positions))
+        else:
+            log.info("startup_positions", n=0)
 
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
@@ -661,7 +673,12 @@ class Engine:
                     self.alerter.alert("inflight_expired",
                                        f"{len(expired)} stuck in-flight guards cleared")
 
-                positions = self._only_traded(await self.gateway.positions())
+                try:
+                    positions = self._only_traded(await self.gateway.positions())
+                except PositionsReadError as exc:
+                    # Keep prior local inventory; never interpret failed read as flat.
+                    log.warning("reconcile_positions_failed", err=str(exc))
+                    positions = None
                 if positions:
                     self.state.reconcile_positions(positions)
                 live = await self.gateway.open_orders()
@@ -680,12 +697,14 @@ class Engine:
                             if self.state.inflight(tok) == 0:
                                 self.state.replace_open_orders(tok, by_token.get(tok, []))
                 if forced:
-                    log.info("forced_reconcile_done", positions=len(positions),
-                             open_orders=len(live))
+                    log.info(
+                        "forced_reconcile_done",
+                        positions=("failed" if positions is None else len(positions)),
+                        open_orders=len(live),
+                    )
                     self._wake_all()
             except Exception as exc:  # noqa: BLE001
                 log.warning("reconcile_error", err=str(exc))
-
             # slower loops: on-chain position divergence + pnl snapshot + WAL
             if rounds % 4 == 0:
                 with contextlib.suppress(Exception):

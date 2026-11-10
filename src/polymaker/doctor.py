@@ -76,11 +76,25 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
                 console.print("  [yellow]! balance is 0 — deposit USDC (mints pUSD) and set "
                               "allowances from the deposit wallet (trade once in the UI)[/yellow]")
 
-            positions = await gw.positions()
-            held_tokens = list(positions)
-            total_shares = sum(sz for sz, _ in positions.values())
-            check("positions readable (on funder)", True,
-                  f"{len(positions)} positions, {total_shares:.0f} shares total")
+            from polymaker.execution.gateway import PositionsReadError
+
+            try:
+                positions = await gw.positions()
+                held_tokens = list(positions)
+                total_shares = sum(sz for sz, _ in positions.values())
+                check("positions readable (on funder)", True,
+                      f"{len(positions)} positions, {total_shares:.0f} shares total")
+                value = await gw.portfolio_value()
+                if value is None:
+                    console.print("  [yellow]! portfolio mark value unknown "
+                                  "(GET /v2/value failed)[/yellow]")
+                else:
+                    console.print(f"  [dim]· position mark value ≈ ${value:.4f} "
+                                  f"(data-api /v2/value on funder)[/dim]")
+            except PositionsReadError as e:
+                check("positions readable (on funder)", False, str(e)[:120])
+                console.print("  [yellow]! positions read failed — do NOT treat as zero inventory; "
+                              "Data API v1 /positions is retired (use /v2/positions)[/yellow]")
         except Exception as e:  # noqa: BLE001
             check("wallet auth (L2 creds derived)", False, str(e))
             console.print("  [yellow]! signature-type mismatch? deposit wallets use sig_type=3 "
@@ -172,13 +186,15 @@ async def _top_political_token(cfg: Config) -> str | None:
 
 
 def _extract_balance(ba: dict[str, Any]) -> float | None:
+    """CLOB collateral balance is always micro-units (6 decimals); always /1e6."""
     if not isinstance(ba, dict):
         return None
+    from polymaker.execution.gateway import collateral_raw_to_usd
+
     for k in ("balance", "collateral", "amount"):
         if k in ba:
             try:
-                v = float(ba[k])
-                return v / 1e6 if v > 1e6 else v
+                return collateral_raw_to_usd(ba[k])
             except (ValueError, TypeError):
                 return None
     return None

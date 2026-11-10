@@ -51,9 +51,10 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 5. **Fine-tick illusion.** On 0.001-tick markets (prices like 19.3¢) per-share
    spread is fractions of a cent — profit is **rewards + rebates**, not spread
    capture. A "+$4 exit" is noise; don't let it set your strategy.
-6. **Stale reads.** The positions API (`data-api`) lags; during a fast move it
-   showed +$1 while the real book was −$5. Trust the live book / on-chain, not the
-   position endpoint mid-move.
+6. **Stale / retired reads.** Positions must use Data API **v2**
+   (`GET /v2/positions` on the **funder/proxy**). v1 `GET /positions` is
+   HTTP **410 Gone** — never treat a failed read as flat inventory. The feed
+   can still lag mid-move; trust the live book / on-chain briefly, then reconcile.
 
 ## Getting out (exits & closing) — learned the hard way
 

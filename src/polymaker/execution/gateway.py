@@ -685,6 +685,12 @@ class ExecutionGateway:
 
         Transport / TLS / HTTP failures raise TradesReadError — callers must
         NOT treat that as zero fills (unknown ≠ empty).
+
+        Do **not** pass top-level ``maker_address=signer``: live CLOB rows can
+        have top-level maker_address/owner that are neither signer nor funder
+        while our leg lives only under ``maker_orders[]``. Filtering there
+        yields a false-empty (fetched=0) and must never be treated as authority.
+        Membership is decided locally when parsing maker_orders.
         """
         if self._client is None:
             raise TradesReadError("trades unavailable: client not connected")
@@ -692,8 +698,8 @@ class ExecutionGateway:
         def _get() -> list[dict[str, Any]]:
             from py_clob_client_v2.clob_types import TradeParams
 
+            # Authenticated L2 scopes the feed; omit maker_address filter.
             params = TradeParams(
-                maker_address=self.address or None,
                 after=after_ts,
                 before=before_ts,
                 asset_id=asset_id,

@@ -393,6 +393,62 @@ class StateStore:
         ).fetchone()
         return row is not None
 
+    def known_order_ids(self) -> set[str]:
+        """Order ids from live map + durable order_log (for REST maker matching)."""
+        ids = set(self.orders.keys())
+        with contextlib.suppress(sqlite3.Error):
+            for row in self._conn.execute("SELECT order_id FROM order_log"):
+                ids.add(str(row["order_id"]))
+        return ids
+
+    def fill_covers_order(self, order_id: str) -> bool:
+        """True if any persisted fill trade_id references this order id."""
+        if not order_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 AS ok FROM fills WHERE trade_id LIKE ? LIMIT 1",
+            (f"%{order_id}%",),
+        ).fetchone()
+        return row is not None
+
+    def matched_orders_missing_fills(self) -> list[dict[str, object]]:
+        """order_log rows that look matched but have no covering fill yet."""
+        out: list[dict[str, object]] = []
+        with contextlib.suppress(sqlite3.Error):
+            rows = self._conn.execute(
+                "SELECT order_id, token_id, side, price, size, state, ts"
+                " FROM order_log"
+                " WHERE upper(state) IN ('PARTIALLY_FILLED','DONE')"
+                " ORDER BY ts ASC"
+            ).fetchall()
+            for row in rows:
+                oid = str(row["order_id"])
+                if self.fill_covers_order(oid):
+                    continue
+                out.append(
+                    {
+                        "order_id": oid,
+                        "token_id": str(row["token_id"]),
+                        "side": str(row["side"]),
+                        "price": float(row["price"]),
+                        "size": float(row["size"]),
+                        "state": str(row["state"]),
+                        "ts": float(row["ts"]),
+                    }
+                )
+        return out
+
+    def earliest_matched_order_ts(self) -> float | None:
+        """Earliest PARTIALLY_FILLED/DONE order_log ts (recovery window hint)."""
+        with contextlib.suppress(sqlite3.Error):
+            row = self._conn.execute(
+                "SELECT MIN(ts) AS ts FROM order_log"
+                " WHERE upper(state) IN ('PARTIALLY_FILLED','DONE')"
+            ).fetchone()
+            if row is not None and row["ts"] is not None:
+                return float(row["ts"])
+        return None
+
     def sum_fill_cash(self) -> float:
         """Rebuild net cash from persisted fills only (+SELL, -BUY)."""
         rows = self._conn.execute("SELECT side, price, size FROM fills").fetchall()

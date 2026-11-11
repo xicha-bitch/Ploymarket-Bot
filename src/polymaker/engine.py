@@ -427,25 +427,41 @@ class Engine:
                 continue
             self.risk.note_unexplained_inventory_delta(delta_inv)
 
+    def _trades_backfill_after_ts(self) -> int:
+        """Bounded lookback that covers cross-day unreconciled matched orders.
+
+        Do NOT clamp up to Shanghai midnight — that dropped the 20:38 incident
+        fill on a next-day restart (after_ts≈23:59).
+        """
+        lookback_s = 36 * 3600.0
+        after = int(max(0.0, self._session_start_ts - lookback_s))
+        hint = self.state.earliest_matched_order_ts()
+        if hint is not None and hint > 0:
+            after = min(after, max(0, int(hint) - 120))
+        return after
+
+    def _shanghai_day_start_ts(self) -> float | None:
+        if not self.risk.day_key:
+            return None
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            return datetime.strptime(self.risk.day_key, "%Y-%m-%d").replace(
+                tzinfo=ZoneInfo("Asia/Shanghai")
+            ).timestamp()
+        except (ValueError, TypeError, OSError):
+            return None
+
     async def _backfill_trades(self, *, reason: str) -> bool:
         """Pull authoritative trades and apply with store dedupe.
 
-        Success with zero rows is OK (confirmed empty). Transport/TLS failure
-        returns False and must NOT be treated as empty — stay protective.
-        Never invents fills from local PnL/order_log.
+        Transport/TLS failure → False (unknown ≠ empty). A successful fetch is
+        not yet ``trades_ok``: coverage must also clear known matched orders
+        missing fills. Never invents fills from local PnL/order_log.
         """
-        after = int(max(0.0, self._session_start_ts - 86400.0))
-        if self.risk.day_key:
-            try:
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
-
-                day_start = datetime.strptime(self.risk.day_key, "%Y-%m-%d").replace(
-                    tzinfo=ZoneInfo("Asia/Shanghai")
-                )
-                after = max(after, int(day_start.timestamp()) - 60)
-            except (ValueError, TypeError, OSError):
-                pass
+        after = self._trades_backfill_after_ts()
+        day_start_ts = self._shanghai_day_start_ts()
         try:
             rows = await self.gateway.get_trades(after_ts=after)
         except TradesReadError as exc:
@@ -453,30 +469,58 @@ class Engine:
             log.warning("trades_backfill_failed", reason=reason, err=str(exc)[:160])
             return False
 
+        our_order_ids = self.state.known_order_ids()
         applied = 0
         for row in rows:
             for fill in fills_from_rest_trade(
-                row, self.gateway.address, self._other_token_for_fill
+                row,
+                self.gateway.address,
+                self._other_token_for_fill,
+                funder_address=self.gateway.funder,
+                our_order_ids=our_order_ids,
             ):
                 if fill.token_id not in self._token_cid:
                     continue
+                count_toward_daily = (
+                    day_start_ts is None or fill.ts <= 0.0 or fill.ts >= day_start_ts
+                )
+                equity_before = self.risk.equity
                 if not self.state.apply_fill(fill):
                     continue
-                self.risk.note_fill(fill)
+                self.risk.note_fill(fill, count_toward_daily=count_toward_daily)
+                if not count_toward_daily:
+                    # apply_fill also moved inventory; keep daily_pnl neutral.
+                    self.risk.absorb_equity_delta_into_baseline(equity_before)
                 applied += 1
                 cid = self._token_cid.get(fill.token_id)
                 if cid:
                     self._wake_cid(cid)
-        self._trades_backfill_ok = True
-        self._last_trades_ok_ts = time.time()
-        log.info(
-            "trades_backfill_ok",
-            reason=reason,
-            fetched=len(rows),
-            applied=applied,
-            after_ts=after,
-        )
-        return True
+
+        missing = self.state.matched_orders_missing_fills()
+        # Only treat traded tokens we care about as coverage gaps.
+        missing_ours = [m for m in missing if str(m["token_id"]) in self._token_cid]
+        coverage_complete = len(missing_ours) == 0
+        self._trades_backfill_ok = coverage_complete
+        if coverage_complete:
+            self._last_trades_ok_ts = time.time()
+            log.info(
+                "trades_backfill_ok",
+                reason=reason,
+                fetched=len(rows),
+                applied=applied,
+                after_ts=after,
+            )
+        else:
+            log.warning(
+                "trades_backfill_incomplete",
+                reason=reason,
+                fetched=len(rows),
+                applied=applied,
+                after_ts=after,
+                missing_n=len(missing_ours),
+                missing_oid_prefix=str(missing_ours[0]["order_id"])[:12],
+            )
+        return coverage_complete
 
     def _other_token_for_fill(self, token_id: str) -> str | None:
         cid = self._token_cid.get(token_id)

@@ -66,8 +66,13 @@ class RiskManager:
         self._order_errors = 0
 
     # ── PnL bookkeeping ─────────────────────────────────────────────────
-    def note_fill(self, fill: Fill) -> None:
-        """Apply authoritative fill cash. Never call with synthetic/invented fills."""
+    def note_fill(self, fill: Fill, *, count_toward_daily: bool = True) -> None:
+        """Apply authoritative fill cash. Never call with synthetic/invented fills.
+
+        When ``count_toward_daily`` is False, skip the daily-loss trip; the
+        engine should ``absorb_equity_delta_into_baseline`` after apply_fill so
+        historical backfills do not move today's daily_pnl.
+        """
         notional = fill.price * fill.size
         signed = notional if fill.side is Side.SELL else -notional
         self._net_cash += signed
@@ -78,7 +83,18 @@ class RiskManager:
             if self._conserved_usdc < 1e-12:
                 self._conserved_usdc = 0.0
         self._persist_day()
-        self._trip_daily_loss_if_needed()
+        if count_toward_daily:
+            self._trip_daily_loss_if_needed()
+
+    def absorb_equity_delta_into_baseline(self, equity_before: float) -> None:
+        """Shift day_start by equity change so daily_pnl is unchanged."""
+        if not self._day_key:
+            return
+        delta = self.equity - equity_before
+        if abs(delta) < 1e-12:
+            return
+        self._day_start_equity += delta
+        self._persist_day()
 
     def note_unexplained_inventory_delta(self, delta_inv_value: float) -> None:
         """Inventory MTM changed without a fill (e.g. REST flatten).

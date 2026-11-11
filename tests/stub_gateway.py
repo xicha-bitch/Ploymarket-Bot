@@ -82,3 +82,7 @@ class StubGateway:
     @property
     def address(self) -> str:
         return "0xstub"
+
+    @property
+    def funder(self) -> str:
+        return "0xstub"

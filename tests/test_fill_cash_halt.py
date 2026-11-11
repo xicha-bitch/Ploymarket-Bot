@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from polymaker.config import RiskConfig
-from polymaker.domain import Fill, Side
+from polymaker.domain import Fill, OpenOrder, OrderState, Side
 from polymaker.execution.gateway import (
     OpenOrdersReadError,
     PositionsReadError,
@@ -199,46 +199,270 @@ def test_authoritative_ok_clears_only_when_pnl_above_kill(tmp_path, meta):
     store.close()
 
 
-def test_fills_from_rest_trade_flat_and_maker_orders():
-    our = "0xabc"
+def test_fills_from_rest_trade_never_uses_taker_aggregate():
+    """Live incident shape: top-level size is taker aggregate; our leg is maker_orders."""
+    signer = "0xsigner"
+    funder = "0xfunder"
+    our_oid = "0xaea72e10deadbeef"
+
     def other(t: str) -> str | None:
         return "no" if t == "yes" else "yes"
 
-    flat = {
+    row = {
+        "id": "35551f90-trade",
+        "asset_id": "yes",
+        "side": "BUY",
+        "size": "888.04",  # taker aggregate — NOT our fill
+        "price": "0.049",
+        "status": "CONFIRMED",
+        "trader_side": "MAKER",
+        "outcome": "Yes",
+        "maker_address": "0xsomeoneelse",
+        "owner": "0xalsoelse",
+        "match_time": "1731254308",
+        "maker_orders": [
+            {
+                "oid": "0xe3508a58other",
+                "side": "BUY",
+                "size": "878.06",
+                "price": "0.951",
+                "matched": "878.06",
+                "maker_address": "0xother",
+            },
+            {
+                "oid": our_oid,
+                "side": "SELL",
+                "size": "9.98",
+                "price": "0.049",
+                "matched": "9.98",
+                "maker_address": "0xnotsigner",
+            },
+        ],
+    }
+    # Match by known order id (top-level maker_address filter would miss this row).
+    fills = fills_from_rest_trade(
+        row, signer, other, funder_address=funder, our_order_ids={our_oid}
+    )
+    assert len(fills) == 1
+    assert fills[0].side is Side.SELL
+    assert fills[0].size == pytest.approx(9.98)
+    assert fills[0].price == pytest.approx(0.049)
+    assert fills[0].size != pytest.approx(888.04)
+    assert our_oid in fills[0].trade_id
+
+    # Others' maker shares excluded even if we pass no order ids and wrong addrs.
+    assert fills_from_rest_trade(row, signer, other, funder_address=funder) == []
+
+    # MAKER without maker_orders must not invent from top-level aggregate.
+    flat_maker = {
         "id": "t-flat",
         "asset_id": "yes",
         "side": "BUY",
-        "size": "10",
-        "price": "0.05",
-        "status": "TRADE_STATUS_CONFIRMED",
+        "size": "888.04",
+        "price": "0.049",
+        "status": "CONFIRMED",
         "trader_side": "MAKER",
-        "maker_address": our,
-        "match_time": "1700000000",
+        "maker_address": signer,
     }
-    fills = fills_from_rest_trade(flat, our, other)
-    assert len(fills) == 1
-    assert fills[0].side is Side.SELL
-    assert fills[0].size == 10
+    assert fills_from_rest_trade(flat_maker, signer, other) == []
 
-    nested = {
-        "id": "t-nested",
+    # TAKER uses top-level size (ours).
+    flat_taker = {
+        "id": "t-taker",
         "asset_id": "yes",
         "side": "BUY",
-        "outcome": "Yes",
+        "size": "5",
+        "price": "0.03",
         "status": "CONFIRMED",
-        "timestamp": "1700000000000",
+        "trader_side": "TAKER",
+    }
+    taker_fills = fills_from_rest_trade(flat_taker, signer, other)
+    assert len(taker_fills) == 1 and taker_fills[0].side is Side.BUY
+    assert taker_fills[0].size == 5
+
+    # Proxy/funder identity on maker leg.
+    by_funder = {
+        "id": "t-funder",
+        "asset_id": "yes",
+        "side": "BUY",
+        "size": "100",
+        "price": "0.05",
+        "status": "CONFIRMED",
+        "trader_side": "MAKER",
+        "outcome": "Yes",
         "maker_orders": [
-            {"maker_address": our, "matched_amount": "3", "price": "0.04", "outcome": "Yes"}
+            {
+                "oid": "0xproxyorder",
+                "side": "SELL",
+                "matched": "2",
+                "price": "0.05",
+                "maker_address": funder,
+                "outcome": "Yes",
+            }
         ],
     }
-    fills2 = fills_from_rest_trade(nested, our, other)
-    assert len(fills2) == 1 and fills2[0].size == 3
+    ff = fills_from_rest_trade(by_funder, signer, other, funder_address=funder)
+    assert len(ff) == 1 and ff[0].size == 2
+
+
+def test_rest_fill_dedupe_and_partial_multi_maker(tmp_path):
+    s = StateStore(tmp_path / "d.db")
+    our_oid = "0xaea72e10"
+    row = {
+        "id": "tr1",
+        "asset_id": "tok",
+        "side": "BUY",
+        "size": "20",
+        "price": "0.05",
+        "status": "CONFIRMED",
+        "trader_side": "MAKER",
+        "outcome": "Yes",
+        "maker_orders": [
+            {"oid": "0xother", "side": "SELL", "matched": "10.02", "price": "0.05"},
+            {"oid": our_oid, "side": "SELL", "matched": "9.98", "price": "0.05"},
+        ],
+    }
+    fills = fills_from_rest_trade(
+        row, "0xus", lambda _t: None, our_order_ids={our_oid}
+    )
+    assert len(fills) == 1
+    assert s.apply_fill(fills[0]) is True
+    assert s.apply_fill(fills[0]) is False
+    assert s.fill_covers_order(our_oid)
+    assert s.matched_orders_missing_fills() == []
+    s.upsert_order(
+        OpenOrder(our_oid, "tok", Side.SELL, 0.05, 0.01, OrderState.PARTIALLY_FILLED)
+    )
+    assert s.matched_orders_missing_fills() == []  # fill already covers oid
+    s.close()
 
 
 def test_transient_net_error_detection() -> None:
     assert is_transient_net_error(TimeoutError("handshake timed out"))
     assert is_transient_net_error(RuntimeError("SSL: UNEXPECTED_EOF_WHILE_READING"))
     assert not is_transient_net_error(ValueError("bad payload"))
+
+
+def test_matched_order_missing_fill_is_coverage_gap(tmp_path):
+    s = StateStore(tmp_path / "gap.db")
+    oid = "0xaea72e10"
+    s.upsert_order(
+        OpenOrder(oid, "tok", Side.SELL, 0.049, 0.01, OrderState.PARTIALLY_FILLED)
+    )
+    missing = s.matched_orders_missing_fills()
+    assert len(missing) == 1 and missing[0]["order_id"] == oid
+    assert s.earliest_matched_order_ts() is not None
+    s.close()
+
+
+async def test_backfill_window_covers_cross_day_partial(tmp_path, meta) -> None:
+    """after_ts must not clamp to Shanghai midnight (missed 20:38 fill)."""
+    eng = _engine_with_market(tmp_path, meta)
+    eng.risk.bootstrap_session()
+    # Incident order from prior evening
+    incident_ts = time.time() - 20 * 3600
+    eng.state.upsert_order(
+        OpenOrder(
+            "0xaea72e10",
+            meta.yes.token_id,
+            Side.SELL,
+            0.049,
+            0.01,
+            OrderState.PARTIALLY_FILLED,
+            created_ts=incident_ts,
+        )
+    )
+    # Force order_log ts (upsert uses time.time for persist)
+    eng.state._conn.execute(
+        "UPDATE order_log SET ts=? WHERE order_id=?",
+        (incident_ts, "0xaea72e10"),
+    )
+    eng.state._conn.commit()
+    after = eng._trades_backfill_after_ts()
+    assert after <= int(incident_ts) - 100
+
+    captured: dict[str, object] = {}
+
+    class Capturing(StubGateway):
+        async def get_trades(self, **kwargs):
+            captured.update(kwargs)
+            return []
+
+    eng.gateway = Capturing()  # type: ignore[assignment]
+    ok = await eng._backfill_trades(reason="test_window")
+    assert captured.get("after_ts") == after
+    # Empty fetch while PARTIALLY_FILLED uncovered → incomplete, not false authority
+    assert ok is False
+    assert eng._trades_backfill_ok is False
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_backfill_applies_maker_leg_and_neutralizes_historical_daily(
+    tmp_path, meta
+) -> None:
+    eng = _engine_with_market(tmp_path, meta)
+    eng.risk.bootstrap_session()
+    day_pnl_before = eng.risk.daily_pnl
+    our_oid = "0xaea72e10"
+    # Historical match_time well before Shanghai day start
+    row = {
+        "id": "35551f90",
+        "asset_id": meta.yes.token_id,
+        "side": "BUY",
+        "size": "888.04",
+        "price": "0.049",
+        "status": "CONFIRMED",
+        "trader_side": "MAKER",
+        "outcome": "Yes",
+        "maker_address": "0xelse",
+        "match_time": "1000000000",
+        "maker_orders": [
+            {
+                "oid": our_oid,
+                "side": "SELL",
+                "matched": "9.98",
+                "price": "0.049",
+                "maker_address": "0xelse",
+            }
+        ],
+    }
+
+    class WithTrade(StubGateway):
+        async def get_trades(self, **kwargs):
+            return [row]
+
+    eng.gateway = WithTrade()  # type: ignore[assignment]
+    eng.state.upsert_order(
+        OpenOrder(
+            our_oid,
+            meta.yes.token_id,
+            Side.SELL,
+            0.049,
+            0.01,
+            OrderState.PARTIALLY_FILLED,
+        )
+    )
+    ok = await eng._backfill_trades(reason="hist")
+    assert ok is True
+    assert eng.state.fills_count() == 1
+    assert eng.state.fill_covers_order(our_oid)
+    # Historical cash must not invent today's daily move
+    assert eng.risk.daily_pnl == pytest.approx(day_pnl_before, abs=1e-6)
+    assert eng.risk.net_cash == pytest.approx(9.98 * 0.049)
+    eng.state.close()
+    eng.catalog.close()
+
+
+def test_get_trades_params_omit_maker_address() -> None:
+    """Regression: top-level maker_address filter caused false-empty authority."""
+    import inspect
+
+    from polymaker.execution import gateway as gw_mod
+
+    src = inspect.getsource(gw_mod.ExecutionGateway.get_trades)
+    assert "maker_address=self.address" not in src
+    assert "TradeParams(" in src
 
 
 async def test_disconnect_recovery_blocks_quotes_until_authority(tmp_path, meta) -> None:

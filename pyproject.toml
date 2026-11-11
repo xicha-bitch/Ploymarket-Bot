@@ -23,6 +23,8 @@ dependencies = [
     "socksio>=1.0",
     "python-socks>=2.4",
     "py-builder-relayer-client>=0.0.2",
+    # IANA tz database for zoneinfo on Windows (ZoneInfo('Asia/Shanghai')).
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]

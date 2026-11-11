@@ -55,6 +55,47 @@ class OpenOrdersReadError(RuntimeError):
     """CLOB open-orders read failed — must NOT be treated as an empty book."""
 
 
+class TradesReadError(RuntimeError):
+    """CLOB trades read failed — must NOT be treated as an empty fill list."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_s = retry_after_s
+
+
+def is_transient_net_error(exc: BaseException) -> bool:
+    """SSL / timeout / disconnect style failures that deserve a bounded retry."""
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    needles = (
+        "ssl",
+        "timeout",
+        "timed out",
+        "unexpected_eof",
+        "connection reset",
+        "connection aborted",
+        "temporarily unavailable",
+        "connect error",
+        "request exception",
+    )
+    if any(n in msg for n in needles):
+        return True
+    if name in {"ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}:
+        return True
+    # Unwrap httpx / PolyApiException wrappers
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return is_transient_net_error(cause)
+    return False
+
+
 def parse_retry_after_s(raw: str | None) -> float | None:
     """Parse Retry-After as delay-seconds. HTTP-date forms are ignored (None)."""
     if raw is None:
@@ -148,9 +189,11 @@ class ExecutionGateway:
         self._cancel_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._hb_id: str = ""  # heartbeat chain
         self._hb_failures: int = 0
+        self._hb_next_ok_to_try: float = 0.0  # monotonic: bounded backoff gate
         # dedicated, bounded pool for blocking order/HTTP calls so a burst of
         # requotes across many markets can't starve the default executor
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clob-io")
+        self._readonly_attempts: int = 3
 
     @property
     def order_pressure(self) -> float:
@@ -164,6 +207,36 @@ class ExecutionGateway:
         """Run a blocking client call on the dedicated pool."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, fn, *args)
+
+    async def _io_retry(
+        self,
+        fn: Callable[..., _T],
+        *args: Any,
+        attempts: int | None = None,
+        label: str = "clob_io",
+    ) -> _T:
+        """Bounded retry for transient SSL/timeout failures (readonly-safe)."""
+        n = self._readonly_attempts if attempts is None else max(1, attempts)
+        last: BaseException | None = None
+        for i in range(n):
+            try:
+                return await self._io(fn, *args)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if not is_transient_net_error(exc) or i + 1 >= n:
+                    raise
+                delay = min(2.0**i, 8.0)
+                log.warning(
+                    "clob_io_retry",
+                    label=label,
+                    attempt=i + 1,
+                    of=n,
+                    sleep_s=delay,
+                    err=str(exc)[:160],
+                )
+                await asyncio.sleep(delay)
+        assert last is not None
+        raise last
 
     @property
     def creds(self) -> Any:
@@ -506,8 +579,18 @@ class ExecutionGateway:
         Consecutive failures are tracked in `heartbeat_failures`: after enough
         misses the exchange auto-cancels ALL our orders, so the engine must
         stop quoting and resync once the heartbeat recovers.
+
+        Failures use bounded exponential backoff (``heartbeat_backoff_s``) so
+        SSL/timeout storms do not hammer the endpoint every interval tick.
         """
         if self._client is None:
+            self._hb_failures += 1
+            return False
+
+        now = time.monotonic()
+        if now < self._hb_next_ok_to_try:
+            # Still in backoff window from a prior failure — count as soft miss
+            # without another network call.
             self._hb_failures += 1
             return False
 
@@ -515,22 +598,37 @@ class ExecutionGateway:
             return self._client.post_heartbeat(self._hb_id)
 
         try:
-            resp = await self._io(_beat)
+            # One bounded retry on transient SSL/timeout for the beat itself.
+            resp = await self._io_retry(_beat, attempts=2, label="heartbeat")
             new_id = _first(resp, "heartbeat_id", "heartbeatId", "id")
             self._hb_id = str(new_id) if new_id else ""
             if self._hb_failures:
                 log.info("heartbeat_recovered", after_failures=self._hb_failures)
             self._hb_failures = 0
+            self._hb_next_ok_to_try = 0.0
             return True
         except Exception as exc:  # noqa: BLE001
             self._hb_failures += 1
             self._hb_id = ""  # broken chain — restart it
-            log.warning("heartbeat_failed", err=str(exc), consecutive=self._hb_failures)
+            backoff = min(2.0 ** min(self._hb_failures, 6), 60.0)
+            self._hb_next_ok_to_try = time.monotonic() + backoff
+            log.warning(
+                "heartbeat_failed",
+                err=str(exc)[:160],
+                consecutive=self._hb_failures,
+                backoff_s=round(backoff, 2),
+            )
             return False
 
     @property
     def heartbeat_failures(self) -> int:
         return self._hb_failures
+
+    @property
+    def heartbeat_backoff_s(self) -> float:
+        """Seconds remaining before the next heartbeat network attempt."""
+        rem = self._hb_next_ok_to_try - time.monotonic()
+        return max(0.0, rem)
 
     # ── reads ───────────────────────────────────────────────────────────
     async def open_orders(self) -> list[OpenOrder]:
@@ -567,12 +665,64 @@ class ExecutionGateway:
             return out
 
         try:
-            return await self._io(_get)
+            return await self._io_retry(_get, label="open_orders")
         except OpenOrdersReadError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("open_orders_failed", err=str(exc))
             raise OpenOrdersReadError(f"open_orders read failed: {exc}") from exc
+
+    async def get_trades(
+        self,
+        *,
+        after_ts: int | None = None,
+        before_ts: int | None = None,
+        asset_id: str | None = None,
+        market: str | None = None,
+        only_first_page: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Authenticated trade history. Empty list means confirmed none.
+
+        Transport / TLS / HTTP failures raise TradesReadError — callers must
+        NOT treat that as zero fills (unknown ≠ empty).
+
+        Do **not** pass top-level ``maker_address=signer``: live CLOB rows can
+        have top-level maker_address/owner that are neither signer nor funder
+        while our leg lives only under ``maker_orders[]``. Filtering there
+        yields a false-empty (fetched=0) and must never be treated as authority.
+        Membership is decided locally when parsing maker_orders.
+        """
+        if self._client is None:
+            raise TradesReadError("trades unavailable: client not connected")
+
+        def _get() -> list[dict[str, Any]]:
+            from py_clob_client_v2.clob_types import TradeParams
+
+            # Authenticated L2 scopes the feed; omit maker_address filter.
+            params = TradeParams(
+                after=after_ts,
+                before=before_ts,
+                asset_id=asset_id,
+                market=market,
+            )
+            raw = self._client.get_trades(params, only_first_page=only_first_page)
+            if raw is None:
+                return []
+            if not isinstance(raw, list):
+                raise TradesReadError("unexpected get_trades response shape")
+            out: list[dict[str, Any]] = []
+            for row in raw:
+                if isinstance(row, dict):
+                    out.append(row)
+            return out
+
+        try:
+            return await self._io_retry(_get, label="get_trades")
+        except TradesReadError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_trades_failed", err=str(exc)[:160])
+            raise TradesReadError(f"trades read failed: {exc}") from exc
 
     async def positions(self) -> dict[str, tuple[float, float]]:
         """{token_id: (size, avg_price)} from Data API v2 (reconcile use).
@@ -590,53 +740,72 @@ class ExecutionGateway:
 
         out: dict[str, tuple[float, float]] = {}
         cursor: str | None = None
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as c:
-                for _page in range(_POSITIONS_MAX_PAGES):
-                    params: dict[str, Any] = {"user": user}
-                    if cursor:
-                        params["cursor"] = cursor
-                    else:
-                        params["limit"] = _POSITIONS_PAGE_LIMIT
-                    url = f"{self._data_host}/v2/positions"
-                    r = await c.get(url, params=params)
-                    if r.status_code != 200:
-                        body = ""
-                        with contextlib.suppress(Exception):
-                            body = (r.text or "")[:180]
-                        retry_after_s = parse_retry_after_s(r.headers.get("Retry-After"))
-                        log.warning(
-                            "positions_failed",
-                            status=r.status_code,
-                            host=self._data_host,
-                            path="/v2/positions",
-                            # funder prefix only — never full keys/secrets
-                            funder=user[:10],
-                            retry_after_s=retry_after_s,
-                            detail=body,
-                        )
-                        raise PositionsReadError(
-                            f"data-api GET /v2/positions HTTP {r.status_code}: {body}",
-                            status_code=r.status_code,
-                            retry_after_s=retry_after_s,
-                        )
-                    rows, cursor = parse_v2_positions_page(r.json())
-                    for row in rows:
-                        mapped = map_position_row(row)
-                        if mapped is None:
-                            continue
-                        token_id, size, avg = mapped
-                        out[token_id] = (size, avg)
-                    if cursor is None:
-                        return out
-                raise PositionsReadError(
-                    f"positions pagination exceeded {_POSITIONS_MAX_PAGES} pages"
+        last_transient: Exception | None = None
+        for attempt in range(self._readonly_attempts):
+            out = {}
+            cursor = None
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    for _page in range(_POSITIONS_MAX_PAGES):
+                        params: dict[str, Any] = {"user": user}
+                        if cursor:
+                            params["cursor"] = cursor
+                        else:
+                            params["limit"] = _POSITIONS_PAGE_LIMIT
+                        url = f"{self._data_host}/v2/positions"
+                        r = await c.get(url, params=params)
+                        if r.status_code != 200:
+                            body = ""
+                            with contextlib.suppress(Exception):
+                                body = (r.text or "")[:180]
+                            retry_after_s = parse_retry_after_s(r.headers.get("Retry-After"))
+                            log.warning(
+                                "positions_failed",
+                                status=r.status_code,
+                                host=self._data_host,
+                                path="/v2/positions",
+                                # funder prefix only — never full keys/secrets
+                                funder=user[:10],
+                                retry_after_s=retry_after_s,
+                                detail=body,
+                            )
+                            raise PositionsReadError(
+                                f"data-api GET /v2/positions HTTP {r.status_code}: {body}",
+                                status_code=r.status_code,
+                                retry_after_s=retry_after_s,
+                            )
+                        rows, cursor = parse_v2_positions_page(r.json())
+                        for row in rows:
+                            mapped = map_position_row(row)
+                            if mapped is None:
+                                continue
+                            token_id, size, avg = mapped
+                            out[token_id] = (size, avg)
+                        if cursor is None:
+                            return out
+                    raise PositionsReadError(
+                        f"positions pagination exceeded {_POSITIONS_MAX_PAGES} pages"
+                    )
+            except PositionsReadError:
+                raise
+            except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+                last_transient = exc
+                if not is_transient_net_error(exc) or attempt + 1 >= self._readonly_attempts:
+                    log.warning("positions_failed", err=str(exc), funder=user[:10])
+                    raise PositionsReadError(f"positions read failed: {exc}") from exc
+                delay = min(2.0**attempt, 8.0)
+                log.warning(
+                    "positions_retry",
+                    attempt=attempt + 1,
+                    sleep_s=delay,
+                    err=str(exc)[:160],
+                    funder=user[:10],
                 )
-        except PositionsReadError:
-            raise
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
-            log.warning("positions_failed", err=str(exc), funder=user[:10])
-            raise PositionsReadError(f"positions read failed: {exc}") from exc
+                await asyncio.sleep(delay)
+        assert last_transient is not None
+        raise PositionsReadError(
+            f"positions read failed: {last_transient}"
+        ) from last_transient
 
     async def portfolio_value(self) -> float | None:
         """Mark-to-market position value (USDC) for the funder via Data API v2.

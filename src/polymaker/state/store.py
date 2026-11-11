@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS health_records (
     reconcile      TEXT NOT NULL,
     detail_json    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS risk_day (
+    day_key            TEXT PRIMARY KEY,
+    day_start_equity   REAL NOT NULL,
+    net_cash           REAL NOT NULL,
+    conserved_usdc     REAL NOT NULL,
+    daily_loss_latched INT NOT NULL,
+    updated_ts         REAL NOT NULL
+);
 """
 
 
@@ -131,7 +139,7 @@ class StateStore:
         api_positions: dict[str, tuple[float, float]],
         *,
         is_snapshot: bool = True,
-    ) -> None:
+    ) -> list[tuple[str, float, float, float]]:
         """Overwrite sizes from REST, skipping tokens with in-flight trades or
         a very recent fill (the optimistic value is more current there).
 
@@ -140,18 +148,34 @@ class StateStore:
         in-flight and recent-fill guards). Incremental updates must pass
         ``is_snapshot=False`` so absent tokens are left untouched. A failed
         REST read must not call this with None or a fabricated empty dict.
+
+        Returns a list of ``(token_id, old_size, new_size, unit_price)`` deltas
+        actually applied (for equity-conservation accounting). unit_price is the
+        prior avg_price when flattening, else the REST avg.
         """
         if api_positions is None:
             raise ValueError(
                 "api_positions must not be None (REST failure is not an empty snapshot)"
             )
         now = time.time()
+        deltas: list[tuple[str, float, float, float]] = []
+
+        def _apply(token_id: str, size: float, avg: float) -> None:
+            prev = self.positions.get(token_id)
+            old_size = prev.size if prev is not None else 0.0
+            old_avg = prev.avg_price if prev is not None else 0.0
+            if abs(old_size - size) < 1e-12:
+                return
+            unit = old_avg if size < old_size and old_avg > 0 else (avg if avg > 0 else old_avg)
+            self.set_position(token_id, size, avg)
+            deltas.append((token_id, old_size, size, unit))
+
         for token_id, (size, avg) in api_positions.items():
             if self._inflight.get(token_id, 0) > 0:
                 continue
             if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
                 continue
-            self.set_position(token_id, size, avg)
+            _apply(token_id, size, avg)
 
         if is_snapshot:
             for token_id, pos in list(self.positions.items()):
@@ -160,7 +184,8 @@ class StateStore:
                         continue
                     if now - self._last_fill_ts.get(token_id, 0.0) < 5.0:
                         continue
-                    self.set_position(token_id, 0.0, 0.0)
+                    _apply(token_id, 0.0, 0.0)
+        return deltas
 
     # ── in-flight guard ─────────────────────────────────────────────────
     def mark_inflight(self, token_id: str) -> None:
@@ -361,6 +386,138 @@ class StateStore:
     def fills_count(self) -> int:
         """Alias used by Telegram status copy."""
         return self.fill_count()
+
+    def has_fill(self, trade_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 AS ok FROM fills WHERE trade_id=? LIMIT 1", (trade_id,)
+        ).fetchone()
+        return row is not None
+
+    def known_order_ids(self) -> set[str]:
+        """Order ids from live map + durable order_log (for REST maker matching)."""
+        ids = set(self.orders.keys())
+        with contextlib.suppress(sqlite3.Error):
+            for row in self._conn.execute("SELECT order_id FROM order_log"):
+                ids.add(str(row["order_id"]))
+        return ids
+
+    def fill_covers_order(self, order_id: str) -> bool:
+        """True if any persisted fill trade_id references this order id."""
+        if not order_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 AS ok FROM fills WHERE trade_id LIKE ? LIMIT 1",
+            (f"%{order_id}%",),
+        ).fetchone()
+        return row is not None
+
+    def matched_orders_missing_fills(self) -> list[dict[str, object]]:
+        """order_log rows that look matched but have no covering fill yet."""
+        out: list[dict[str, object]] = []
+        with contextlib.suppress(sqlite3.Error):
+            rows = self._conn.execute(
+                "SELECT order_id, token_id, side, price, size, state, ts"
+                " FROM order_log"
+                " WHERE upper(state) IN ('PARTIALLY_FILLED','DONE')"
+                " ORDER BY ts ASC"
+            ).fetchall()
+            for row in rows:
+                oid = str(row["order_id"])
+                if self.fill_covers_order(oid):
+                    continue
+                out.append(
+                    {
+                        "order_id": oid,
+                        "token_id": str(row["token_id"]),
+                        "side": str(row["side"]),
+                        "price": float(row["price"]),
+                        "size": float(row["size"]),
+                        "state": str(row["state"]),
+                        "ts": float(row["ts"]),
+                    }
+                )
+        return out
+
+    def earliest_matched_order_ts(self) -> float | None:
+        """Earliest PARTIALLY_FILLED/DONE order_log ts (recovery window hint)."""
+        with contextlib.suppress(sqlite3.Error):
+            row = self._conn.execute(
+                "SELECT MIN(ts) AS ts FROM order_log"
+                " WHERE upper(state) IN ('PARTIALLY_FILLED','DONE')"
+            ).fetchone()
+            if row is not None and row["ts"] is not None:
+                return float(row["ts"])
+        return None
+
+    def sum_fill_cash(self) -> float:
+        """Rebuild net cash from persisted fills only (+SELL, -BUY)."""
+        rows = self._conn.execute("SELECT side, price, size FROM fills").fetchall()
+        total = 0.0
+        for row in rows:
+            signed = 1.0 if str(row["side"]).upper() == "SELL" else -1.0
+            total += signed * float(row["price"]) * float(row["size"])
+        return total
+
+    def latest_pnl_snapshot(self) -> dict[str, float] | None:
+        row = self._conn.execute(
+            "SELECT ts, equity, net_cash, inventory_value, daily_pnl"
+            " FROM pnl_snapshots ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ts": float(row["ts"]),
+            "equity": float(row["equity"]),
+            "net_cash": float(row["net_cash"]),
+            "inventory_value": float(row["inventory_value"]),
+            "daily_pnl": float(row["daily_pnl"]),
+        }
+
+    def save_risk_day(
+        self,
+        *,
+        day_key: str,
+        day_start_equity: float,
+        net_cash: float,
+        conserved_usdc: float,
+        daily_loss_latched: bool,
+    ) -> None:
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.execute(
+                "INSERT OR REPLACE INTO risk_day"
+                "(day_key,day_start_equity,net_cash,conserved_usdc,daily_loss_latched,updated_ts)"
+                " VALUES(?,?,?,?,?,?)",
+                (
+                    day_key,
+                    day_start_equity,
+                    net_cash,
+                    conserved_usdc,
+                    int(daily_loss_latched),
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+
+    def load_risk_day(self) -> dict[str, object] | None:
+        """Most recently updated risk_day row (usually today's)."""
+        try:
+            row = self._conn.execute(
+                "SELECT day_key, day_start_equity, net_cash, conserved_usdc,"
+                " daily_loss_latched, updated_ts"
+                " FROM risk_day ORDER BY updated_ts DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        return {
+            "day_key": str(row["day_key"]),
+            "day_start_equity": float(row["day_start_equity"]),
+            "net_cash": float(row["net_cash"]),
+            "conserved_usdc": float(row["conserved_usdc"]),
+            "daily_loss_latched": bool(row["daily_loss_latched"]),
+            "updated_ts": float(row["updated_ts"]),
+        }
 
 
 def _pos_json(p: Position) -> str:

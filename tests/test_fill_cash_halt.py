@@ -42,6 +42,21 @@ def _rm(tmp_path, **over):
     return RiskManager(cfg, store), store
 
 
+def test_asia_shanghai_zoneinfo_requires_tzdata() -> None:
+    """Windows ships no system zoneinfo; tzdata must provide Asia/Shanghai.
+
+    Missing tzdata raises ZoneInfoNotFoundError at import/startup (b0dea54 crash).
+    """
+    import tzdata  # noqa: F401 — runtime dep declared in pyproject
+
+    tz = ZoneInfo("Asia/Shanghai")
+    assert str(tz) == "Asia/Shanghai"
+    key = shanghai_day_key(1_700_000_000.0)  # uses Asia/Shanghai
+    assert key == "2023-11-15"
+    # day-boundary helper must construct the same zone without OS tz files
+    assert datetime.now(tz=tz).tzinfo is not None
+
+
 def test_rest_flatten_without_fill_does_not_invent_daily_loss(tmp_path, meta):
     """Incident shape: inventory MTM vanishes, net_cash stays 0, fills empty."""
     rm, store = _rm(tmp_path)

@@ -131,8 +131,10 @@ async def test_telegram_status_exit_order_resting_vs_unknown(tmp_path, meta) -> 
 
     eng.gateway = WithSell()  # type: ignore[assignment]
     text = await eng._telegram_status_text()
-    assert "退出报价允许：是" in text
-    assert "已确认有挂单（SELL=1）" in text
+    assert "退出报价：是" in text
+    assert "有(SELL=1)" in text
+    assert "日亏锁：" in text
+    assert "恢复阻断：" in text
 
     class BoomOrders(StubGateway):
         async def open_orders(self):
@@ -143,9 +145,9 @@ async def test_telegram_status_exit_order_resting_vs_unknown(tmp_path, meta) -> 
 
     eng.gateway = BoomOrders()  # type: ignore[assignment]
     text2 = await eng._telegram_status_text()
-    assert "退出报价允许：是" in text2
-    assert "未知（读取失败" in text2
-    assert "不视为仍保留" in text2
+    assert "退出报价：是" in text2
+    assert "未知（不视为仍保留）" in text2
+    assert "有(SELL=" not in text2
     eng.state.close()
     eng.catalog.close()
 

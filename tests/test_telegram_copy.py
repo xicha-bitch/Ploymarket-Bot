@@ -1,4 +1,4 @@
-"""Chinese Telegram status copy: labels, units, fail≠0, no fake profit."""
+"""Chinese Telegram status copy: compact, fail≠0, exit口径 clear."""
 
 from __future__ import annotations
 
@@ -28,20 +28,25 @@ def test_status_uses_real_newlines_and_chinese_labels() -> None:
         session_daily_delta=0.4940,
         stop_requested=False,
         positions={"abc1234567890": {"size": 9.99, "avg_price": 0.048}},
+        daily_loss_latched=False,
+        recovery_blocked=False,
     )
     assert "\\n" not in text
     assert "\n" in text
-    assert "CLOB 可用余额" in text
-    assert "挂单占用" in text
-    assert "仓位标记市值" in text
-    assert "本进程记录成交笔数：0" in text
-    assert "会话当日变动：暂不可用" in text
-    assert "不能解读为已盈利" in text
-    assert "不是交易所账户总资产" in text
+    assert "余额" in text and "0.529557" in text
+    assert "买单占用" in text
+    assert "标记市值" in text
+    assert "成交 0" in text
+    assert "当日变动 暂不可用（无成交）" in text
+    assert "会话权益 0.4940 pUSD" in text
     assert "【账户总资产】" not in text
-    assert "数量=" in text and "份" in text
-    assert "均价=" in text and "pUSD/份" in text
-    assert "已请求暂停新下单：否" in text
+    assert "仓 abc123456789…" in text
+    assert "9.9900@0.0480" in text
+    assert "暂停新下单：否" in text
+    assert "日亏锁：否" in text
+    assert "恢复阻断：否" in text
+    # Compact: few lines, no long jargon dumps
+    assert text.count("\n") <= 8
 
 
 def test_status_api_fail_unknown() -> None:
@@ -58,7 +63,7 @@ def test_status_api_fail_unknown() -> None:
         positions=None,
     )
     assert text.count("未知/读取失败") >= 3
-    assert "已请求暂停新下单：是" in text
+    assert "暂停新下单：是" in text
 
 
 def test_pnl_hides_delta_when_no_fills() -> None:
@@ -70,7 +75,7 @@ def test_pnl_hides_delta_when_no_fills() -> None:
         fills=0,
     )
     assert "暂不可用" in text
-    assert "不是交易所账户总资产" in text
+    assert "非账户总资产" in text
     assert "【账户总资产】" not in text
 
 
@@ -92,10 +97,10 @@ def test_status_report_distinguishes_exit_quoting_vs_exchange_orders() -> None:
         exit_order_status="resting",
         exit_sell_count=1,
     )
-    assert "不可行入场被阻止：是" in text
+    assert "入场受阻：是" in text
     assert "单边库存：是" in text
-    assert "退出报价允许：是" in text
-    assert "交易所退出卖单：已确认有挂单（SELL=1）" in text
+    assert "退出报价：是" in text
+    assert "交易所卖单：有(SELL=1)" in text
     assert "退出路径仍保留：是" not in text  # no longer hardcoded bool success
     assert "【账户总资产】" not in text
 
@@ -116,10 +121,9 @@ def test_exit_order_unknown_never_reads_as_retained() -> None:
         exit_quoting_allowed=True,
         exit_order_status="unknown",
     )
-    assert "退出报价允许：是" in text
-    assert "未知（读取失败" in text
-    assert "不视为仍保留" in text
-    assert "已确认有挂单（SELL=" not in text
+    assert "退出报价：是" in text
+    assert "未知（不视为仍保留）" in text
+    assert "有(SELL=" not in text
 
 
 def test_exit_order_confirmed_none() -> None:
@@ -138,4 +142,4 @@ def test_exit_order_confirmed_none() -> None:
         exit_order_status="none",
         exit_sell_count=0,
     )
-    assert "交易所退出卖单：已确认无" in text
+    assert "交易所卖单：无" in text

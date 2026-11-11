@@ -1577,6 +1577,8 @@ class Engine:
             exit_quoting_allowed=exit_quoting_allowed,
             exit_order_status=exit_order_status,  # type: ignore[arg-type]
             exit_sell_count=exit_sell_count,
+            daily_loss_latched=bool(self.risk.daily_loss_latched),
+            recovery_blocked=bool(self._recovery_blocked),
         )
 
     def _telegram_pnl_text(self) -> str:

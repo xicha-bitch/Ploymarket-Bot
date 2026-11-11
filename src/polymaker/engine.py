@@ -26,7 +26,9 @@ from polymaker.execution.gateway import (
     ExecutionGateway,
     OpenOrdersReadError,
     PositionsReadError,
+    TradesReadError,
 )
+from polymaker.execution.trades import fills_from_rest_trade
 from polymaker.execution.intent import (
     PlacementIntent,
     PlacementIntentStore,
@@ -123,6 +125,11 @@ class Engine:
         self._last_heartbeat_ok_ts: float = 0.0
         self._last_reconcile_ok_ts: float = 0.0
         self._last_reconcile_fail_ts: float = 0.0
+        # Recovery / authority gates: unknown official data => stay protective.
+        self._recovery_blocked: bool = False
+        self._trades_backfill_ok: bool = False
+        self._last_trades_ok_ts: float = 0.0
+        self._session_start_ts: float = time.time()
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -135,6 +142,9 @@ class Engine:
         # freshen reward/fee/end-date params from live Gamma BEFORE quoting so a
         # stale catalog (e.g. old reward min-size) can't mis-size our orders
         await self.refresh_market_metadata()
+        # Restore day baseline + sticky latch before reconcile so conservation
+        # can persist and restart cannot wipe an in-day daily_loss halt.
+        self.risk.bootstrap_session()
         await self._startup_reconcile()
 
         # subscribe feeds
@@ -173,8 +183,14 @@ class Engine:
             self._spawn("telegram", self.telegram.run_forever)
             if self.telegram.push_periodic:
                 self._spawn("telegram_status", self.telegram.run_status_loop)
-        self.risk.reset_day()
-        log.info("engine_started", markets=len(self.metas))
+        self.risk.roll_day_if_needed()
+        log.info(
+            "engine_started",
+            markets=len(self.metas),
+            day=self.risk.day_key,
+            daily_loss_latched=self.risk.daily_loss_latched,
+            trades_backfill_ok=self._trades_backfill_ok,
+        )
 
     @staticmethod
     def _make_telegram(cfg: Config) -> TelegramBot:
@@ -376,14 +392,173 @@ class Engine:
             )
             raise
         # Empty dict is a valid complete snapshot and must zero stale locals.
-        self.state.reconcile_positions(positions, is_snapshot=True)
-        log.info("startup_positions", n=len(positions))
+        # Prefer fill backfill BEFORE position snapshot so cash is authoritative.
+        trades_ok = await self._backfill_trades(reason="startup")
+        deltas = self.state.reconcile_positions(positions, is_snapshot=True)
+        self._apply_inventory_conservation(deltas)
+        # Positions succeeded here; trades may still be unknown (TLS). Stay
+        # protective until trades backfill also succeeds — do not auto-clear halt.
+        self._recovery_blocked = not trades_ok
+        if trades_ok:
+            self.risk.try_clear_false_daily_loss(authoritative_ok=True)
+        log.info(
+            "startup_positions",
+            n=len(positions),
+            deltas=len(deltas),
+            trades_ok=trades_ok,
+            recovery_blocked=self._recovery_blocked,
+            daily_loss_latched=self.risk.daily_loss_latched,
+        )
 
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
         other markets are the operator's business — they must not enter our
         state, exposure caps, or PnL."""
         return {t: v for t, v in positions.items() if t in self._token_cid}
+
+    def _apply_inventory_conservation(
+        self, deltas: list[tuple[str, float, float, float]]
+    ) -> None:
+        """Conserve equity for inventory changes that did not come from fills."""
+        for token_id, old_size, new_size, unit in deltas:
+            mark = self.risk.unit_value(token_id, fallback=unit)
+            delta_inv = (new_size - old_size) * mark
+            if abs(delta_inv) < 1e-12:
+                continue
+            self.risk.note_unexplained_inventory_delta(delta_inv)
+
+    async def _backfill_trades(self, *, reason: str) -> bool:
+        """Pull authoritative trades and apply with store dedupe.
+
+        Success with zero rows is OK (confirmed empty). Transport/TLS failure
+        returns False and must NOT be treated as empty — stay protective.
+        Never invents fills from local PnL/order_log.
+        """
+        after = int(max(0.0, self._session_start_ts - 86400.0))
+        if self.risk.day_key:
+            try:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+
+                day_start = datetime.strptime(self.risk.day_key, "%Y-%m-%d").replace(
+                    tzinfo=ZoneInfo("Asia/Shanghai")
+                )
+                after = max(after, int(day_start.timestamp()) - 60)
+            except (ValueError, TypeError, OSError):
+                pass
+        try:
+            rows = await self.gateway.get_trades(after_ts=after)
+        except TradesReadError as exc:
+            self._trades_backfill_ok = False
+            log.warning("trades_backfill_failed", reason=reason, err=str(exc)[:160])
+            return False
+
+        applied = 0
+        for row in rows:
+            for fill in fills_from_rest_trade(
+                row, self.gateway.address, self._other_token_for_fill
+            ):
+                if fill.token_id not in self._token_cid:
+                    continue
+                if not self.state.apply_fill(fill):
+                    continue
+                self.risk.note_fill(fill)
+                applied += 1
+                cid = self._token_cid.get(fill.token_id)
+                if cid:
+                    self._wake_cid(cid)
+        self._trades_backfill_ok = True
+        self._last_trades_ok_ts = time.time()
+        log.info(
+            "trades_backfill_ok",
+            reason=reason,
+            fetched=len(rows),
+            applied=applied,
+            after_ts=after,
+        )
+        return True
+
+    def _other_token_for_fill(self, token_id: str) -> str | None:
+        cid = self._token_cid.get(token_id)
+        if cid is None:
+            return None
+        meta = self.metas.get(cid)
+        if meta is None:
+            return None
+        return meta.other_token(token_id)
+
+    async def _authoritative_resync(self, *, reason: str) -> bool:
+        """Trades + positions + open-orders must all succeed before trust returns.
+
+        Empty successful reads are fine. Any failure => unknown, stay protective.
+        May clear a false-positive daily_loss latch only when accounting after
+        conservation no longer breaches the kill; never clears on transport miss.
+        """
+        trades_ok = await self._backfill_trades(reason=reason)
+        positions_ok = False
+        orders_ok = False
+        positions: dict[str, tuple[float, float]] | None = None
+        try:
+            positions = self._only_traded(await self.gateway.positions())
+            positions_ok = True
+            self._positions_fail_streak = 0
+            self._positions_backoff_until = 0.0
+            self._positions_healthy = True
+            self._last_reconcile_ok_ts = time.time()
+        except PositionsReadError as exc:
+            self._positions_fail_streak += 1
+            self._positions_healthy = False
+            delay = self._positions_backoff_delay_s(exc)
+            self._positions_backoff_until = time.monotonic() + delay
+            log.warning(
+                "authoritative_positions_failed", reason=reason, err=str(exc)[:160]
+            )
+
+        live: list[Any] | None = None
+        try:
+            live = await self.gateway.open_orders()
+            orders_ok = True
+        except OpenOrdersReadError as exc:
+            log.warning(
+                "authoritative_orders_failed", reason=reason, err=str(exc)[:160]
+            )
+
+        if positions is not None:
+            deltas = self.state.reconcile_positions(positions, is_snapshot=True)
+            self._apply_inventory_conservation(deltas)
+        if live is not None:
+            by_token: dict[str, list[Any]] = {}
+            for o in live:
+                by_token.setdefault(o.token_id, []).append(o)
+            for meta in self.metas.values():
+                for tok in (meta.yes.token_id, meta.no.token_id):
+                    if self.state.inflight(tok) == 0:
+                        self.state.replace_open_orders(
+                            tok, by_token.get(tok, []), grace_s=0.0
+                        )
+
+        authoritative_ok = trades_ok and positions_ok and orders_ok
+        if authoritative_ok:
+            self._recovery_blocked = False
+            cleared, why = self.risk.try_clear_false_daily_loss(authoritative_ok=True)
+            log.info(
+                "authoritative_resync_ok",
+                reason=reason,
+                daily_loss_cleared=cleared,
+                clear_why=why,
+                daily_pnl=round(self.risk.daily_pnl, 6),
+            )
+        else:
+            self._recovery_blocked = True
+            self.risk.try_clear_false_daily_loss(authoritative_ok=False)
+            log.warning(
+                "authoritative_resync_incomplete",
+                reason=reason,
+                trades_ok=trades_ok,
+                positions_ok=positions_ok,
+                orders_ok=orders_ok,
+            )
+        return authoritative_ok
 
     # ── callbacks ───────────────────────────────────────────────────────
     def _on_dirty(self, condition_id: str, token_id: str) -> None:
@@ -402,9 +577,13 @@ class Engine:
 
     def _on_user_reconnect(self) -> None:
         """User WS reconnected: events during the gap were lost — force an
-        immediate REST reconcile before trusting our state again."""
+        immediate authoritative resync before trusting our state again."""
         log.warning("user_ws_reconnected_forcing_reconcile")
+        self._recovery_blocked = True
         self._reconcile_now.set()
+        self._aux_tasks.append(
+            asyncio.create_task(self._authoritative_resync(reason="user_reconnect"))
+        )
 
     def _on_trade(self, tp: TradePrint) -> None:
         cid = self._token_cid.get(tp.asset_id)
@@ -602,16 +781,31 @@ class Engine:
             self.cfg.engine.heartbeat
             and self.gateway.heartbeat_failures >= self.cfg.risk.heartbeat_halt_failures
         )
+        # Do not place new quotes while positions/trades authority is unknown or
+        # a disconnect recovery is still incomplete (prevents duplicate orders /
+        # duplicate fill accounting).
+        recovery_blind = (
+            self._recovery_blocked
+            or not self._positions_healthy
+            or (self._user_started and not self._trades_backfill_ok and self.user is not None)
+        )
         halted = cid in self._halted
-        blind = market_stale or user_blind or hb_blind or halted
+        blind = market_stale or user_blind or hb_blind or halted or recovery_blind
         if blind:
-            log.warning("market_blind", cid=cid[:8], market_stale=market_stale,
-                        user_blind=user_blind, hb_blind=hb_blind, halted=halted)
+            log.warning(
+                "market_blind",
+                cid=cid[:8],
+                market_stale=market_stale,
+                user_blind=user_blind,
+                hb_blind=hb_blind,
+                recovery_blind=recovery_blind,
+                halted=halted,
+            )
             self.alerter.alert(
                 f"blind:{cid[:8]}",
                 f"{meta.question[:40]} blind (stale={market_stale} user={user_blind} "
-                f"hb={hb_blind} halted={halted})",
-                critical=hb_blind,
+                f"hb={hb_blind} recovery={recovery_blind} halted={halted})",
+                critical=hb_blind or recovery_blind,
             )
 
         rd = self.risk.evaluate(meta, ws_stale=blind,
@@ -939,19 +1133,25 @@ class Engine:
                 # exchange is (or soon will be) auto-cancelling everything we
                 # have live; recompute will see hb_blind and pull quotes
                 self._hb_was_down = True
+                self._recovery_blocked = True
                 log.critical("heartbeat_down_halting", failures=self.gateway.heartbeat_failures)
                 self._wake_all()
             elif ok and self._hb_was_down:
-                # recovered: our server-side orders were wiped — drop local
-                # order state, resync authoritatively, then resume quoting
+                # recovered: server-side orders were wiped — clear local orders
+                # and require authoritative trades/positions/orders before quotes.
                 self._hb_was_down = False
                 log.warning("heartbeat_recovered_resyncing")
                 self.state.clear_orders()
-                for meta in self.metas.values():
-                    with contextlib.suppress(Exception):
-                        await self._refresh_token_orders(meta, grace_s=0.0)
-                self._wake_all()
-            await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
+                self._recovery_blocked = True
+                auth_ok = await self._authoritative_resync(reason="heartbeat_recover")
+                if auth_ok:
+                    self._wake_all()
+                else:
+                    log.warning("heartbeat_recover_still_blind")
+                    self._wake_all()  # pull quotes via recovery_blind
+            delay = self.cfg.engine.heartbeat_interval_s
+            delay = max(delay, self.gateway.heartbeat_backoff_s)
+            await asyncio.sleep(delay)
 
     def _positions_backoff_delay_s(self, exc: PositionsReadError) -> float:
         """Retry-After when present; else exponential cap. No busy-loop."""
@@ -962,9 +1162,19 @@ class Engine:
 
     def _record_health_snapshot(self, *, reconcile: str) -> None:
         """Persist one redacted local health row (acceptance evidence)."""
-        hb = "ok" if self._last_heartbeat_ok_ts > 0 else "unknown"
+        hb = "unknown"
         if self.cfg.engine.heartbeat and self._last_heartbeat_ok_ts <= 0:
             hb = "pending"
+        elif self._last_heartbeat_ok_ts > 0:
+            age = time.time() - self._last_heartbeat_ok_ts
+            # Align column with real freshness (avoid "ok" with multi-minute age).
+            stale_after = max(30.0, self.cfg.engine.heartbeat_interval_s * 6)
+            if self.gateway.heartbeat_failures >= self.cfg.risk.heartbeat_halt_failures:
+                hb = "down"
+            elif age > stale_after:
+                hb = "stale"
+            else:
+                hb = "ok"
         market = "unknown"
         with contextlib.suppress(Exception):
             market = self.md.health_market_state()
@@ -997,6 +1207,10 @@ class Engine:
             "pos_healthy": bool(self._positions_healthy),
             "orders_n": len(self.state.orders),
             "pos_n": sum(1 for p in self.state.positions.values() if p.size > 0),
+            "trades_ok": bool(self._trades_backfill_ok),
+            "recovery_blocked": bool(self._recovery_blocked),
+            "daily_loss_latched": bool(self.risk.daily_loss_latched),
+            "conserved_usdc": round(self.risk.conserved_usdc, 6),
         }
         self.state.record_health(
             heartbeat=hb,
@@ -1074,7 +1288,8 @@ class Engine:
                             self._wake_all()
                 if positions is not None:
                     # Empty dict is a valid complete snapshot and must zero stale locals.
-                    self.state.reconcile_positions(positions, is_snapshot=True)
+                    deltas = self.state.reconcile_positions(positions, is_snapshot=True)
+                    self._apply_inventory_conservation(deltas)
 
                 live: list[Any] | None
                 try:
@@ -1102,12 +1317,25 @@ class Engine:
                                 if self.state.inflight(tok) == 0:
                                     self.state.replace_open_orders(tok, by_token.get(tok, []))
                 if forced:
+                    # Forced path (reconnect): also refresh trades when possible.
+                    trades_ok = await self._backfill_trades(reason="forced_reconcile")
+                    authoritative_ok = (
+                        trades_ok and positions is not None and live is not None
+                    )
+                    if authoritative_ok:
+                        self._recovery_blocked = False
+                        self.risk.try_clear_false_daily_loss(authoritative_ok=True)
+                    else:
+                        self._recovery_blocked = True
                     log.info(
                         "forced_reconcile_done",
                         positions=("failed" if positions is None else len(positions)),
                         open_orders=("failed" if live is None else len(live)),
+                        trades_ok=trades_ok,
+                        recovery_blocked=self._recovery_blocked,
                     )
                     self._wake_all()
+                self.risk.roll_day_if_needed()
             except Exception as exc:  # noqa: BLE001
                 reconcile_status = "error"
                 log.warning("reconcile_error", err=str(exc))
@@ -1143,8 +1371,14 @@ class Engine:
                     f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
                     critical=True,
                 )
-                self.state.force_set_position(tok, chain_size, self.state.position(tok).avg_price,
-                                              source="onchain")
+                prev = self.state.position(tok)
+                old_size = prev.size
+                old_avg = prev.avg_price
+                self.state.force_set_position(tok, chain_size, old_avg, source="onchain")
+                unit = self.risk.unit_value(tok, fallback=old_avg)
+                self._apply_inventory_conservation(
+                    [(tok, old_size, chain_size, unit)]
+                )
                 cid = self._token_cid.get(tok)
                 if cid:
                     self._wake_cid(cid)

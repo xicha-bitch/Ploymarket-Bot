@@ -71,3 +71,14 @@ class StubGateway:
 
     async def positions(self) -> dict[str, tuple[float, float]]:
         return {}
+
+    async def get_trades(self, **kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    @property
+    def heartbeat_backoff_s(self) -> float:
+        return 0.0
+
+    @property
+    def address(self) -> str:
+        return "0xstub"

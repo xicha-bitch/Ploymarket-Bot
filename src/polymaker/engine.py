@@ -18,6 +18,11 @@ from typing import Any
 
 from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
+from polymaker.catalog.selection import (
+    SelectCandidate,
+    score_market_for_selection,
+    select_and_allocate,
+)
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, OpenOrder, Quote, Regime, Side, TargetQuotes
@@ -28,13 +33,13 @@ from polymaker.execution.gateway import (
     PositionsReadError,
     TradesReadError,
 )
-from polymaker.execution.trades import fills_from_rest_trade
 from polymaker.execution.intent import (
     PlacementIntent,
     PlacementIntentStore,
     client_key_for,
 )
 from polymaker.execution.reconciler import reconcile
+from polymaker.execution.trades import fills_from_rest_trade
 from polymaker.journal import Journal
 from polymaker.logging import get_logger
 from polymaker.marketdata.parse import TradePrint
@@ -43,13 +48,13 @@ from polymaker.merge import Merger
 from polymaker.risk.manager import RiskManager
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
+from polymaker.strategy.budget import filter_quotes_to_budget, place_headroom_usdc
 from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.budget import filter_quotes_to_budget, place_headroom_usdc
 from polymaker.strategy.maker_gates import compute_exit_urgency
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
@@ -130,6 +135,14 @@ class Engine:
         self._trades_backfill_ok: bool = False
         self._last_trades_ok_ts: float = 0.0
         self._session_start_ts: float = time.time()
+        # Auto-selection. Pinned ids come from markets.toml. Exit-only names
+        # still have inventory and must not be given new BUY budget.
+        self._pinned: set[str] = set()
+        self._exit_only: set[str] = set()
+        self._buy_budget: dict[str, float] = {}
+        self._scale_budget: set[str] = set()
+        self._feeds_started = False
+        self._quoters_started = False
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -137,8 +150,9 @@ class Engine:
         await self.gateway.connect()
         await self._refresh_collateral(force=True)
         await self._resolve_markets()
-        if not self.metas:
-            log.warning("no_markets_selected", hint="add markets to config/markets.toml, run `polymaker scan`")
+        # Restore the last auto-set BEFORE reconcile so those tokens are not
+        # dropped as "untracked" and a held position can force exit-only.
+        await self._restore_persisted_selection()
         # freshen reward/fee/end-date params from live Gamma BEFORE quoting so a
         # stale catalog (e.g. old reward min-size) can't mis-size our orders
         await self.refresh_market_metadata()
@@ -146,6 +160,13 @@ class Engine:
         # can persist and restart cannot wipe an in-day daily_loss halt.
         self.risk.bootstrap_session()
         await self._startup_reconcile()
+        if self.cfg.selection.auto:
+            await self._refresh_auto_selection()
+        if not self.metas:
+            log.warning(
+                "no_markets_selected",
+                hint="add markets to config/markets.toml, or set [selection] auto=true",
+            )
 
         # subscribe feeds
         self.md.set_markets([(cid, [m.yes.token_id, m.no.token_id]) for cid, m in self.metas.items()])
@@ -172,6 +193,8 @@ class Engine:
         self._spawn("maintenance", self._maintenance_loop)
         for cid in self.metas:
             self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
+        self._feeds_started = True
+        self._quoters_started = True
         self._spawn("supervisor", self._supervise)
         # Telegram side-channel: faults stay inside the poll task (never kills trade).
         self.telegram.bind(
@@ -290,14 +313,8 @@ class Engine:
                 if meta is None:
                     log.warning("market_unresolved", ref=entry.ref)
                     continue
-                self.metas[meta.condition_id] = meta
-                self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
-                self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
-                self.regime_m[meta.condition_id] = RegimeMachine()
-                self._dirty[meta.condition_id] = asyncio.Event()
-                self._locks[meta.condition_id] = asyncio.Lock()
-                for tok in (meta.yes.token_id, meta.no.token_id):
-                    self._token_cid[tok] = meta.condition_id
+                self._install_market(meta, self.cfg.profile_for(entry))
+                self._pinned.add(meta.condition_id)
 
     async def _fetch_meta(
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
@@ -323,6 +340,403 @@ class Engine:
             flow=FlowEstimator(p.flow_ewma_halflife_s),
             markout=MarkoutTracker(),
         )
+
+    def _profile_for_auto(self) -> StrategyProfile:
+        name = self.cfg.selection.profile
+        profile = self.cfg.profiles.get(name)
+        if profile is not None:
+            return profile
+        for cid in self._pinned:
+            existing = self.profiles.get(cid)
+            if existing is not None:
+                return existing
+        if self.cfg.profiles:
+            return next(iter(self.cfg.profiles.values()))
+        return StrategyProfile()
+
+    def _install_market(self, meta: MarketMeta, profile: StrategyProfile) -> None:
+        """Register quoting state for a market. No-op if it is already installed."""
+        cid = meta.condition_id
+        if cid in self.metas:
+            return
+        self.metas[cid] = meta
+        self.profiles[cid] = profile
+        self.est[cid] = self._make_estimators(profile)
+        self.regime_m[cid] = RegimeMachine()
+        self._dirty[cid] = asyncio.Event()
+        self._locks[cid] = asyncio.Lock()
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            self._token_cid[tok] = cid
+        with contextlib.suppress(Exception):
+            self.catalog.upsert_market(meta)
+
+    def _meta_has_inventory(self, meta: MarketMeta) -> bool:
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            if self.state.position(tok).size > 1e-6:
+                return True
+        return False
+
+    def _ensure_quoter(self, cid: str) -> None:
+        if not self._quoters_started:
+            return
+        name = f"quote:{cid[:8]}"
+        existing = self._tasks.get(name)
+        if existing is not None and not existing.done():
+            return
+        self._spawn(name, lambda c=cid: self._quoter(c))
+
+    def _cancel_quoter(self, cid: str) -> asyncio.Task[Any] | None:
+        name = f"quote:{cid[:8]}"
+        self._task_specs.pop(name, None)
+        task = self._tasks.pop(name, None)
+        if task is not None and not task.done():
+            task.cancel()
+        return task
+
+    async def _restore_persisted_selection(self) -> None:
+        """Reattach the previous auto-set so startup reconcile still sees it."""
+        if not self.cfg.selection.auto:
+            return
+        saved = self.catalog.load_active_selection()
+        missing = [cid for cid, _role in saved if cid not in self.metas]
+        if not missing:
+            for cid, role in saved:
+                if role == "exit_only" and cid in self.metas:
+                    self._exit_only.add(cid)
+            return
+        raws: dict[str, Any] = {}
+        rates: dict[str, float] = {}
+        try:
+            async with GammaClient(self.cfg.wallet.gamma_host) as gamma:
+                raws = await gamma.markets_by_condition(missing)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("selection_restore_fetch_failed", err=str(exc)[:160])
+        try:
+            rates = await fetch_reward_rates(self.cfg.wallet.clob_host)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("selection_restore_rewards_failed", err=str(exc)[:160])
+        roles = {cid: role for cid, role in saved}
+        for cid in missing:
+            meta: MarketMeta | None = None
+            raw = raws.get(cid)
+            if raw:
+                meta = parse_market(raw, rates, allow_inactive=True)
+            if meta is None:
+                meta = self.catalog.get(cid)
+            if meta is None:
+                log.warning("selection_restore_unresolved", cid=cid[:8])
+                continue
+            self._install_market(meta, self._profile_for_auto())
+            if roles.get(cid) == "exit_only":
+                self._exit_only.add(cid)
+
+    async def _scan_selection_catalog(self) -> list[MarketMeta]:
+        sel = self.cfg.selection
+        try:
+            rates = await fetch_reward_rates(self.cfg.wallet.clob_host)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto_select_rewards_failed", err=str(exc)[:160])
+            rates = {}
+        kept: list[MarketMeta] = []
+        try:
+            async with GammaClient(self.cfg.wallet.gamma_host) as gamma:
+                tag_id = self.catalog.cached_tag(sel.tag_slug)
+                if tag_id is None:
+                    tag_id = await gamma.resolve_tag_id(sel.tag_slug)
+                    if tag_id:
+                        self.catalog.cache_tag(sel.tag_slug, tag_id)
+                async for raw in gamma.iter_markets(
+                    tag_id=tag_id,
+                    min_liquidity=sel.min_liquidity,
+                    max_pages=sel.max_pages,
+                ):
+                    meta = parse_market(raw, rates)
+                    if meta is None:
+                        continue
+                    if sel.rewards_only and meta.rewards_daily_rate <= 0:
+                        continue
+                    kept.append(meta)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto_select_scan_failed", err=str(exc)[:160])
+            if not kept:
+                kept = [m for m, _sc in self.catalog.top(limit=200, fresh_s=6 * 3600.0)]
+        return kept
+
+    def _view_for_score(self, fresh: MarketMeta) -> MarketMeta:
+        """Score with live top-of-book when we have it, else the scan's Gamma top.
+
+        Token ids stay on the installed market so a refresh cannot retarget a position.
+        """
+        installed = self.metas.get(fresh.condition_id)
+        if installed is None:
+            return fresh
+        from dataclasses import replace
+
+        live = self._overlay_live_top(installed)
+        if live.best_bid > 0.0 and live.best_ask > live.best_bid:
+            base = live
+        else:
+            base = replace(installed, best_bid=fresh.best_bid, best_ask=fresh.best_ask)
+        return replace(
+            base,
+            liquidity_num=fresh.liquidity_num or base.liquidity_num,
+            rewards_daily_rate=fresh.rewards_daily_rate or base.rewards_daily_rate,
+            volume_24hr=fresh.volume_24hr or base.volume_24hr,
+            end_date_iso=fresh.end_date_iso or base.end_date_iso,
+            event_id=fresh.event_id or base.event_id,
+            min_order_size=fresh.min_order_size or base.min_order_size,
+        )
+
+    def _overlay_live_top(self, meta: MarketMeta) -> MarketMeta:
+        if meta.condition_id not in self.metas:
+            return meta
+        book = self.md.book(meta.yes.token_id)
+        if book is None or not self.md.is_fresh(meta.yes.token_id):
+            return meta
+        bb = book.best_bid()
+        ba = book.best_ask()
+        if bb is None or ba is None or bb.price <= 0 or ba.price <= 0 or bb.price >= ba.price:
+            return meta
+        from dataclasses import replace
+
+        return replace(meta, best_bid=bb.price, best_ask=ba.price)
+
+    async def _refresh_auto_selection(self) -> None:
+        """Rescan Gamma and rotate entry markets. Inventory is never dropped."""
+        if not self.cfg.selection.auto:
+            return
+        if self._collateral_usdc is None:
+            await self._refresh_collateral(force=False)
+        if self._collateral_usdc is None:
+            log.warning("auto_select_skipped", reason="no_collateral")
+            return
+        sel = self.cfg.selection
+        try:
+            scanned = await self._scan_selection_catalog()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto_select_scan_failed", err=str(exc)[:200])
+            scanned = []
+
+        held: dict[str, tuple[float, float]] = {}
+        raw_positions: dict[str, tuple[float, float]] | None
+        try:
+            raw_positions = await self.gateway.positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto_select_positions_unread", err=str(exc)[:160])
+            raw_positions = None
+        else:
+            for tok, (size, avg) in raw_positions.items():
+                if size > 1e-6:
+                    held[tok] = (float(size), float(avg))
+
+        by_id: dict[str, MarketMeta] = {m.condition_id: m for m in scanned}
+        for meta in list(self.metas.values()):
+            by_id.setdefault(meta.condition_id, meta)
+        now = time.time()
+        candidates: list[SelectCandidate] = []
+        for meta in by_id.values():
+            view = self._view_for_score(meta)
+            scored = score_market_for_selection(
+                view, now=now, min_hours_to_end=sel.min_hours_to_end
+            )
+            if meta.condition_id in self.metas:
+                installed = self.metas[meta.condition_id]
+                has_inv = self._meta_has_inventory(installed)
+                filled = self.risk.filled_market_notional(installed)
+                resting = self.risk.resting_buy_notional(installed)
+            else:
+                has_inv = False
+                filled = 0.0
+                resting = 0.0
+                for tok in (view.yes.token_id, view.no.token_id):
+                    if tok in held:
+                        size, avg = held[tok]
+                        has_inv = True
+                        filled += size * (avg if avg > 0 else 0.5)
+            candidates.append(
+                SelectCandidate(
+                    condition_id=view.condition_id,
+                    score=scored.score,
+                    min_entry_notional=scored.min_entry_notional or 0.0,
+                    event_id=view.event_id,
+                    pinned=view.condition_id in self._pinned,
+                    has_inventory=has_inv,
+                    filled_usdc=filled,
+                    resting_buy_usdc=resting,
+                    hours_to_end=scored.hours_to_end,
+                    slug=view.slug,
+                    price_known=scored.min_entry_notional is not None,
+                )
+            )
+        previous = [cid for cid in self.metas if cid not in self._exit_only]
+        planned = select_and_allocate(
+            candidates,
+            max_markets=sel.max_markets,
+            previous_ids=previous,
+            hysteresis_margin=sel.hysteresis_margin,
+            available_usdc=self._collateral_usdc,
+            fee_buffer_usdc=_FEE_BUFFER_USDC,
+            max_market_notional_usdc=self.cfg.risk.max_market_notional_usdc,
+            max_event_group_loss_usdc=self.cfg.risk.max_event_group_loss_usdc,
+            max_total_exposure_usdc=self.cfg.risk.max_total_exposure_usdc,
+            filled_total_usdc=self.risk.filled_total_exposure(),
+            lone_market_fraction=sel.lone_market_fraction,
+            min_hours_to_end=sel.min_hours_to_end,
+        )
+        before_tokens = set(self._token_cid)
+        await self._apply_selection(planned, by_id)
+        if raw_positions is not None:
+            self._seed_new_positions(before_tokens, raw_positions)
+        log.info(
+            "auto_selection",
+            entry=sum(1 for p in planned if p.role == "entry"),
+            exit_only=sum(1 for p in planned if p.role == "exit_only"),
+            markets=len(self.metas),
+            slugs=",".join((p.slug or p.condition_id)[:24] for p in planned)[:180],
+        )
+
+    def _seed_new_positions(
+        self,
+        before_tokens: set[str],
+        raw_positions: dict[str, tuple[float, float]],
+    ) -> None:
+        """Import exchange inventory for markets that were just subscribed."""
+        new_tokens = set(self._token_cid) - before_tokens
+        if not new_tokens:
+            return
+        subset = {tok: raw_positions[tok] for tok in new_tokens if tok in raw_positions}
+        if not subset:
+            return
+        deltas = self.state.reconcile_positions(subset, is_snapshot=False)
+        self._apply_inventory_conservation(deltas)
+
+    async def _apply_selection(
+        self,
+        planned: tuple[Any, ...] | list[Any],
+        metas_by_id: dict[str, MarketMeta],
+    ) -> None:
+        want = {p.condition_id: p for p in planned}
+        self._scale_budget = {p.condition_id for p in planned if p.scale_to_budget}
+        for cid, plan in want.items():
+            meta = self.metas.get(cid) or metas_by_id.get(cid)
+            if meta is None:
+                continue
+            if cid not in self.metas:
+                self._install_market(meta, self._profile_for_auto())
+            if plan.role == "exit_only":
+                self._exit_only.add(cid)
+                self._buy_budget[cid] = 0.0
+                self._scale_budget.discard(cid)
+            else:
+                self._exit_only.discard(cid)
+                self._buy_budget[cid] = float(plan.buy_budget_usdc)
+            self._ensure_quoter(cid)
+            self._wake_cid(cid)
+
+        kept: list[tuple[str, str]] = [(cid, p.role) for cid, p in want.items() if cid in self.metas]
+        for cid in list(self.metas):
+            if cid in want or cid in self._pinned:
+                continue
+            retired = await self._retire_market(cid)
+            if not retired and cid in self.metas:
+                self._exit_only.add(cid)
+                self._buy_budget[cid] = 0.0
+                kept.append((cid, "exit_only"))
+        for cid in self._pinned:
+            if cid in self.metas and cid not in {c for c, _r in kept}:
+                role = "exit_only" if cid in self._exit_only else "entry"
+                kept.append((cid, role))
+        with contextlib.suppress(Exception):
+            self.catalog.save_active_selection(kept)
+        await self._sync_subscriptions()
+
+    async def _retire_market(self, cid: str) -> bool:
+        """Remove a flat market. Inventory or a failed cancel keeps it exit-only."""
+        if cid in self._pinned:
+            return False
+        meta = self.metas.get(cid)
+        if meta is None:
+            return True
+        task = self._cancel_quoter(cid)
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        if self._meta_has_inventory(meta):
+            self._exit_only.add(cid)
+            self._buy_budget[cid] = 0.0
+            self._scale_budget.discard(cid)
+            self._ensure_quoter(cid)
+            return False
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            try:
+                ok = await self.gateway.cancel_asset(tok)
+            except Exception:  # noqa: BLE001
+                ok = False
+            if not ok:
+                self._exit_only.add(cid)
+                self._buy_budget[cid] = 0.0
+                self._scale_budget.discard(cid)
+                self._ensure_quoter(cid)
+                log.warning("retire_kept_exit_only", cid=cid[:8], reason="cancel_failed")
+                return False
+        for tok in (meta.yes.token_id, meta.no.token_id):
+            for order in self.state.orders_for(tok):
+                self.state.remove_order(order.order_id)
+            self._token_cid.pop(tok, None)
+            self._inv_open_ts.pop(tok, None)
+        self.metas.pop(cid, None)
+        self.profiles.pop(cid, None)
+        self.est.pop(cid, None)
+        self.regime_m.pop(cid, None)
+        self._dirty.pop(cid, None)
+        self._locks.pop(cid, None)
+        self._exit_only.discard(cid)
+        self._buy_budget.pop(cid, None)
+        self._scale_budget.discard(cid)
+        self._halted.discard(cid)
+        self._last_quote_fv.pop(cid, None)
+        self._entry_blocked_infeasible.pop(cid, None)
+        self._last_budget_skip.pop(cid, None)
+        self._sweep.pop(cid, None)
+        return True
+
+    async def _sync_subscriptions(self) -> None:
+        spec = [(cid, [m.yes.token_id, m.no.token_id]) for cid, m in self.metas.items()]
+        new_tokens = tuple(sorted(tok for _cid, toks in spec for tok in toks))
+        old_tokens = tuple(sorted(self.md.subscription_tokens()))
+        if new_tokens != old_tokens:
+            self.md.set_markets(spec)
+        new_cids = tuple(sorted(self.metas))
+        old_cids = self.user.subscription_markets() if self.user is not None else ()
+        if self.user is not None and tuple(sorted(old_cids)) != new_cids:
+            self.user.set_markets(list(self.metas))
+        changed = new_tokens != old_tokens or (
+            self.user is not None and tuple(sorted(old_cids)) != new_cids
+        )
+        if changed and self._feeds_started:
+            await self.md.close_socket()
+            if self.user is not None:
+                await self.user.close_socket()
+
+    def _active_markets_line(self) -> str | None:
+        if not self.cfg.selection.auto or not self.metas:
+            return None
+        entries: list[str] = []
+        exits: list[str] = []
+        for cid, meta in self.metas.items():
+            label = (meta.slug or cid)[:28]
+            if cid in self._exit_only:
+                exits.append(label)
+            else:
+                entries.append(label)
+        chunks: list[str] = []
+        if entries:
+            chunks.append("活跃 " + ", ".join(entries[:6]))
+        if exits:
+            chunks.append("退出 " + ", ".join(exits[:4]))
+        if not chunks:
+            return None
+        return " | ".join(chunks)[:180]
 
     async def _startup_reconcile(self) -> None:
         """Adopt a known order+position view or fail closed before quoting."""
@@ -869,6 +1283,9 @@ class Engine:
             ),
             p,
         )
+        # A rotated-off market keeps working exits until the position is flat.
+        if cid in self._exit_only and regime not in (Regime.HALTED, Regime.EVENT):
+            regime = Regime.REDUCE_ONLY
 
         # keep inv-open clocks in sync even when fills arrived via REST reconcile
         for tok, pos in ((meta.yes.token_id, pos_yes), (meta.no.token_id, pos_no)):
@@ -885,7 +1302,7 @@ class Engine:
         adv_scale = self.risk.advisory_size_scale(meta)
         size_scale = min(rd.size_scale, adv_scale) if adv_scale < 1.0 else rd.size_scale
 
-        headroom = self._current_headroom(meta)
+        headroom = self._entry_headroom(meta)
         expensive = max(fv, 1.0 - fv)
         self._entry_blocked_infeasible[cid] = bool(
             headroom is not None
@@ -900,6 +1317,11 @@ class Engine:
             risk_size_scale=size_scale,
             yes_exit_urgency=yes_u, no_exit_urgency=no_u,
             headroom_usdc=headroom,
+            size_notional_usdc=(
+                self._buy_budget.get(cid)
+                if cid in self._scale_budget and cid not in self._exit_only
+                else None
+            ),
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
@@ -1047,6 +1469,7 @@ class Engine:
             max_total_exposure_usdc=self.cfg.risk.max_total_exposure_usdc,
             fee_buffer_usdc=_FEE_BUFFER_USDC,
         )
+        headroom = self._cap_headroom(cid, headroom, resting)
         decision = filter_quotes_to_budget(quotes, headroom_usdc=headroom)
         skipped = tuple(decision.skipped)
         if any("reason=infeasible" in msg for msg in skipped):
@@ -1067,6 +1490,28 @@ class Engine:
         elif not skipped:
             self._last_budget_skip.pop(cid, None)
         return list(decision.kept)
+
+    def _cap_headroom(self, cid: str, headroom: float, resting_buy_usdc: float) -> float:
+        """Clip a live headroom figure to this market's allocated BUY slice."""
+        if cid in self._exit_only:
+            return 0.0
+        if not self.cfg.selection.auto or cid not in self._buy_budget:
+            return headroom
+        room = max(0.0, self._buy_budget[cid] - max(0.0, resting_buy_usdc))
+        return min(headroom, room)
+
+    def _entry_headroom(self, meta: MarketMeta) -> float | None:
+        """Headroom for construct_quotes. Exit-only markets get no BUY room."""
+        if meta.condition_id in self._exit_only:
+            return 0.0
+        live = self._current_headroom(meta)
+        if not self.cfg.selection.auto or meta.condition_id not in self._buy_budget:
+            return live
+        resting = self.risk.resting_buy_notional(meta)
+        room = max(0.0, self._buy_budget[meta.condition_id] - resting)
+        if live is None:
+            return room
+        return min(live, room)
 
     def _current_headroom(self, meta: MarketMeta) -> float | None:
         """Best-effort place headroom from the last collateral snapshot (no I/O)."""
@@ -1488,6 +1933,11 @@ class Engine:
         while self._running:
             await asyncio.sleep(self.cfg.engine.catalog_refresh_s)
             await self.refresh_market_metadata()
+            if self.cfg.selection.auto:
+                try:
+                    await self._refresh_auto_selection()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("auto_select_refresh_failed", err=str(exc)[:200])
 
     async def _maintenance_loop(self) -> None:
         """Periodic REST book refresh to catch any silently-missed WS deltas."""
@@ -1579,6 +2029,7 @@ class Engine:
             exit_sell_count=exit_sell_count,
             daily_loss_latched=bool(self.risk.daily_loss_latched),
             recovery_blocked=bool(self._recovery_blocked),
+            active_markets=self._active_markets_line(),
         )
 
     def _telegram_pnl_text(self) -> str:

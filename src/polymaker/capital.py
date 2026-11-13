@@ -1,4 +1,4 @@
-"""Bankroll fitness checks for micro-capital (~$20–30) operation."""
+"""Bankroll fitness checks for micro-capital (~$20–30, and ~$1 live) operation."""
 
 from __future__ import annotations
 
@@ -6,6 +6,12 @@ from dataclasses import dataclass
 
 from polymaker.config import Config
 from polymaker.fees import rebate_payout_warning
+
+# A ~$1 book cannot post several 5-share orders inside the $20–30 concentration
+# ratios. Auto-selection (max_markets >= 2) may use the whole bankroll per
+# market and per base size; total exposure still cannot exceed the bankroll,
+# and the daily-loss latch is not widened.
+_MICRO_SPREAD_BANKROLL_USDC = 5.0
 
 
 @dataclass(frozen=True)
@@ -19,10 +25,25 @@ class CapitalReport:
     tips: list[str]
 
 
+def _micro_spread(cfg: Config, bankroll_usdc: float) -> bool:
+    """True when auto-rotation may deploy a tiny bankroll across markets."""
+    sel = cfg.selection
+    return bool(
+        sel.auto and sel.max_markets >= 2 and 0.0 < bankroll_usdc <= _MICRO_SPREAD_BANKROLL_USDC
+    )
+
+
 def assess_capital(cfg: Config, bankroll_usdc: float) -> CapitalReport:
     warnings: list[str] = []
     tips: list[str] = []
     risk = cfg.risk
+    spread = _micro_spread(cfg, bankroll_usdc)
+    # 60% / 25% keep one name from dominating a $20–30 book. On a ~$1 book
+    # with several markets those ratios reject the only sizes that can fill
+    # a 5-share minimum. The allocator, not this gate, refuses to pile the
+    # whole dollar into one name when another feasible market exists.
+    market_ratio = 1.0 if spread else 0.6
+    base_ratio = 1.0 if spread else 0.25
 
     if bankroll_usdc <= 0:
         warnings.append("Bankroll must be > 0.")
@@ -31,17 +52,23 @@ def assess_capital(cfg: Config, bankroll_usdc: float) -> CapitalReport:
             f"max_total_exposure_usdc ({risk.max_total_exposure_usdc}) exceeds bankroll "
             f"({bankroll_usdc}). Lower risk caps or fund more."
         )
-    if risk.max_market_notional_usdc > bankroll_usdc * 0.6:
-        warnings.append(
-            "max_market_notional_usdc is >60% of bankroll — a single market can dominate risk."
-        )
+    if risk.max_market_notional_usdc > bankroll_usdc * market_ratio:
+        if spread:
+            warnings.append(
+                "max_market_notional_usdc exceeds bankroll — per-market cap must stay "
+                "within available funds."
+            )
+        else:
+            warnings.append(
+                "max_market_notional_usdc is >60% of bankroll — a single market can dominate risk."
+            )
     if risk.daily_loss_kill_usdc > bankroll_usdc * 0.25:
         warnings.append(
             "daily_loss_kill_usdc is >25% of bankroll — tighten the kill switch for micro capital."
         )
 
     for name, profile in cfg.profiles.items():
-        if profile.base_size_usdc > bankroll_usdc * 0.25:
+        if profile.base_size_usdc > bankroll_usdc * base_ratio:
             warnings.append(
                 f"profile {name!r} base_size_usdc={profile.base_size_usdc} is large vs bankroll."
             )

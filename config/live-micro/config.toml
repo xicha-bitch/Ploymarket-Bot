@@ -42,3 +42,10 @@ max_orders_per_batch = 5
 db = "state.db"
 journal_dir = "journal"
 log_dir = "logs"
+
+[selection]
+# Rotate across several feasible markets and spread the ~$1 book.
+# Explicit [[markets]] rows stay pinned. Risk caps above are unchanged.
+auto = true
+max_markets = 4
+profile = "micro-tight"

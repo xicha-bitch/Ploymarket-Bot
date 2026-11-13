@@ -159,3 +159,28 @@ async def test_supervise_restarts_with_backoff_then_resets(tmp_path, meta):
             await sup
         eng.state.close()
         eng.catalog.close()
+
+
+async def test_exit_only_market_sells_inventory_and_skips_buys(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    eng.state.set_position(meta.yes.token_id, 10.0, 0.40)
+    eng._exit_only.add(meta.condition_id)
+    await eng._recompute(meta.condition_id)
+    orders = eng.state.orders_for(meta.yes.token_id) + eng.state.orders_for(meta.no.token_id)
+    assert orders, "exit quote missing"
+    assert all(o.side is Side.SELL for o in orders)
+    eng.state.close()
+    eng.catalog.close()
+
+
+def test_allocated_headroom_caps_one_market(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.selection.auto = True
+    eng._buy_budget[meta.condition_id] = 0.15
+    eng._collateral_usdc = 1.0
+    headroom = eng._entry_headroom(meta)
+    assert headroom is not None
+    assert headroom <= 0.15 + 1e-9
+    eng.state.close()
+    eng.catalog.close()

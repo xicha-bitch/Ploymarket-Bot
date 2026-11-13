@@ -69,6 +69,9 @@ class QuoteInputs:
     yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
     no_exit_urgency: float = 0.0
     headroom_usdc: float | None = None
+    # When set, size BUY orders to this notional instead of profile.base_size_usdc.
+    # The engine sets it only while auto-selection is spreading across 2+ markets.
+    size_notional_usdc: float | None = None
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
@@ -88,6 +91,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     q_max_shares = p.q_max_usdc / max(inp.fv, tick)
     u = _clamp(net_shares / q_max_shares, -1.0, 1.0) if q_max_shares > 0 else 0.0
     reward_floor = m.rewards_min_size * p.reward_size_mult  # scoring size w/ margin
+    size_notional = p.base_size_usdc if inp.size_notional_usdc is None else inp.size_notional_usdc
 
     skew = p.gamma * inp.vol_short * u
 
@@ -128,7 +132,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
         if price is not None and is_min_size_feasible(
             price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
         ):
-            raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m)
+            raw = _size_shares(size_notional, price, common_scale * (1 - max(u, 0.0)), m)
             sized = apply_min_size_clamp(raw, scale=yes_book_scale, meta=m, profile=p)
             before = len(quotes)
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
@@ -144,7 +148,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
         if price is not None and is_min_size_feasible(
             price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
         ):
-            raw = _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m)
+            raw = _size_shares(size_notional, price, common_scale * (1 - max(-u, 0.0)), m)
             sized = apply_min_size_clamp(raw, scale=no_book_scale, meta=m, profile=p)
             before = len(quotes)
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,

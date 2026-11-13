@@ -54,6 +54,100 @@ def place_headroom_usdc(
     return max(0.0, min(bal, mkt, tot))
 
 
+@dataclass(frozen=True, slots=True)
+class BudgetSliceInput:
+    """One selected market asking for a share of BUY budget."""
+
+    condition_id: str
+    event_id: str | None
+    min_entry_notional: float
+    filled_usdc: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetSlice:
+    """Additional resting-BUY allowance for one market (not a sized order)."""
+
+    condition_id: str
+    buy_budget_usdc: float
+    fits_minimum: bool
+
+
+def allocate_buy_budgets(
+    markets: list[BudgetSliceInput] | tuple[BudgetSliceInput, ...],
+    *,
+    available_usdc: float,
+    fee_buffer_usdc: float,
+    max_market_notional_usdc: float,
+    max_event_group_loss_usdc: float,
+    max_total_exposure_usdc: float,
+    filled_total_usdc: float,
+    resting_buy_elsewhere_usdc: float = 0.0,
+    lone_market_fraction: float = 0.60,
+) -> tuple[BudgetSlice, ...]:
+    """Split BUY budget across an already chosen set.
+
+    Cash is ``available - fee buffer - resting buys we will not cancel``.
+    Own resting on these markets is replaceable, so it is not subtracted
+    again here; the quoter subtracts whatever is still live.
+
+    Two or more markets get equal shares. A clipped cap (market / event /
+    total) does not donate the leftover to a sibling — that would dump the
+    book into one name. A single market is capped at ``lone_market_fraction``
+    of the pool unless its exchange minimum is larger, and still cannot
+    exceed market, event, total, or cash.
+    """
+    pool_cash = max(
+        0.0,
+        available_usdc - max(0.0, fee_buffer_usdc) - max(0.0, resting_buy_elsewhere_usdc),
+    )
+    total_room = max(0.0, max_total_exposure_usdc - max(0.0, filled_total_usdc))
+    pool = min(pool_cash, total_room)
+
+    if not markets or pool <= _EPS:
+        return tuple(
+            BudgetSlice(
+                m.condition_id,
+                0.0,
+                fits_minimum=m.min_entry_notional <= _EPS,
+            )
+            for m in markets
+        )
+
+    groups: dict[str, list[BudgetSliceInput]] = {}
+    for m in markets:
+        groups.setdefault(m.event_id or m.condition_id, []).append(m)
+
+    def _structural_room(m: BudgetSliceInput) -> float:
+        market_room = max(0.0, max_market_notional_usdc - max(0.0, m.filled_usdc))
+        sibs = groups[m.event_id or m.condition_id]
+        event_filled = sum(max(0.0, s.filled_usdc) for s in sibs)
+        event_room = max(0.0, max_event_group_loss_usdc - event_filled)
+        event_share = event_room / len(sibs)
+        return max(0.0, min(market_room, event_share))
+
+    if len(markets) == 1:
+        m = markets[0]
+        cap = min(pool, _structural_room(m))
+        soft = pool * min(1.0, max(0.0, lone_market_fraction))
+        # Raise toward the exchange minimum only when that is what makes a
+        # post possible; never past the structural cap.
+        target = min(cap, max(soft, max(0.0, m.min_entry_notional)))
+        if m.min_entry_notional > cap + _EPS:
+            target = cap
+        fits = m.min_entry_notional <= target + _EPS
+        return (BudgetSlice(m.condition_id, target, fits),)
+
+    fair = pool / len(markets)
+    out: list[BudgetSlice] = []
+    for m in markets:
+        target = min(fair, _structural_room(m))
+        target = max(0.0, target)
+        fits = m.min_entry_notional <= target + _EPS
+        out.append(BudgetSlice(m.condition_id, target, fits))
+    return tuple(out)
+
+
 def filter_quotes_to_budget(
     quotes: list[Quote] | tuple[Quote, ...],
     *,

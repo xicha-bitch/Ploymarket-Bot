@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from polymaker.capital import assess_capital
-from polymaker.config import Config, RiskConfig, StrategyProfile
+from polymaker.config import Config, RiskConfig, SelectionConfig, StrategyProfile
 from polymaker.fees import estimate_taker_fee, rebate_payout_warning
 
 
@@ -57,3 +57,52 @@ def test_capital_check_fails_when_exposure_exceeds_bankroll() -> None:
     report = assess_capital(cfg, 25.0)
     assert not report.ok
     assert any("max_total_exposure_usdc" in w for w in report.warnings)
+
+
+def test_micro_auto_allows_market_and_base_within_bankroll() -> None:
+    """~$1 rotation may use the whole bankroll per market, not past it."""
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.0,
+            max_event_group_loss_usdc=0.95,
+            max_market_notional_usdc=1.0,
+            daily_loss_kill_usdc=0.2,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.50, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=True, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert report.ok, report.warnings
+
+
+def test_micro_auto_still_rejects_total_and_daily_over_bankroll() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.5,
+            max_event_group_loss_usdc=1.0,
+            max_market_notional_usdc=1.0,
+            daily_loss_kill_usdc=0.4,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.25, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=True, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert not report.ok
+    assert any("max_total_exposure_usdc" in w for w in report.warnings)
+    assert any("daily_loss_kill_usdc" in w for w in report.warnings)
+
+
+def test_micro_without_auto_keeps_sixty_percent_market_cap() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.0,
+            max_event_group_loss_usdc=0.95,
+            max_market_notional_usdc=0.90,
+            daily_loss_kill_usdc=0.2,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.25, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=False, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert not report.ok
+    assert any("60%" in w for w in report.warnings)

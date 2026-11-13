@@ -119,10 +119,19 @@ class GammaClient:
             offset += limit
 
 
-def parse_market(raw: dict[str, Any], reward_rates: dict[str, float] | None = None) -> MarketMeta | None:
-    """Convert a Gamma market dict into our MarketMeta, or None if unusable."""
+def parse_market(
+    raw: dict[str, Any],
+    reward_rates: dict[str, float] | None = None,
+    *,
+    allow_inactive: bool = False,
+) -> MarketMeta | None:
+    """Convert a Gamma market dict into our MarketMeta, or None if unusable.
+
+    ``allow_inactive`` keeps a closed book addressable so a held position can
+    still be exited. New entries stay on the accepting-orders path.
+    """
     try:
-        if not raw.get("acceptingOrders", False):
+        if not raw.get("acceptingOrders", False) and not allow_inactive:
             return None
         token_ids = _json_list(raw.get("clobTokenIds"))
         outcomes = _json_list(raw.get("outcomes"))

@@ -62,6 +62,7 @@ def format_status_report(
     exit_path_retained: bool | None = None,
     daily_loss_latched: bool | None = None,
     recovery_blocked: bool | None = None,
+    active_markets: str | None = None,
 ) -> str:
     """Compact Chinese /status: key numbers only, clear exit口径."""
     # Compat: older callers may still pass exit_path_retained.
@@ -95,6 +96,10 @@ def format_status_report(
 
     lines = [
         f"市场 {markets} | 挂单 {open_orders}",
+    ]
+    if active_markets:
+        lines.append(active_markets[:180])
+    lines += [
         f"余额 {fmt_money_pusd(balance_clob, digits=6)} | 买单占用 {fmt_money_pusd(resting_buy, digits=6)}",
         f"标记市值 {fmt_money_pusd(position_mark, digits=4)} | 成交 {fmt_int_or_unknown(fills)}",
         f"会话权益 {equity_s} | 当日变动 {daily_s}",

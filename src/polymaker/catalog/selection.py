@@ -23,6 +23,7 @@ from polymaker.strategy.budget import (
     BudgetSlice,
     BudgetSliceInput,
     allocate_buy_budgets,
+    slice_can_rearm,
 )
 
 _EPS = 1e-9
@@ -267,6 +268,7 @@ def select_and_allocate(
     chosen, budgets = _fit_budgets(
         chosen,
         feasible,
+        previous=set(previous_ids),
         max_markets=cap_n,
         available_usdc=available_usdc,
         fee_buffer_usdc=fee_buffer_usdc,
@@ -412,10 +414,28 @@ def _prefer_entries(
     return selected
 
 
+def _would_churn(cand: SelectCandidate, budgets: dict[str, BudgetSlice], group: list[SelectCandidate]) -> bool:
+    """True when this auto name would post a minimum and then be cancelled.
+
+    Pinned names stay. A market that is the only auto name and can at least
+    fit its minimum is kept; price-stable retain holds that single order.
+    """
+    if cand.pinned:
+        return False
+    sl = budgets.get(cand.condition_id)
+    if sl is None or slice_can_rearm(sl.buy_budget_usdc, cand.min_entry_notional):
+        return False
+    other_autos = any(not c.pinned and c.condition_id != cand.condition_id for c in group)
+    pinned_present = any(c.pinned for c in group)
+    alone = not other_autos and not pinned_present and sl.fits_minimum
+    return not alone
+
+
 def _fit_budgets(
     chosen: list[SelectCandidate],
     feasible: list[SelectCandidate],
     *,
+    previous: set[str],
     max_markets: int,
     available_usdc: float,
     fee_buffer_usdc: float,
@@ -426,7 +446,13 @@ def _fit_budgets(
     resting_buy_elsewhere_usdc: float,
     lone_market_fraction: float,
 ) -> tuple[list[SelectCandidate], dict[str, BudgetSlice]]:
-    """Drop autos that cannot fund an exchange minimum; refill the free slots."""
+    """Drop autos that cannot fund an exchange minimum; refill the free slots.
+
+    A name whose minimum consumes its slice is dropped: the next quote pass
+    would see leftover cash below one more 5-share order and cancel the bid
+    it just posted. Fresh names are shed before incumbents, so a refresh does
+    not churn a resting market to make room for a new one.
+    """
     group = list(chosen)
 
     def alloc(group_now: list[SelectCandidate]) -> dict[str, BudgetSlice]:
@@ -460,9 +486,17 @@ def _fit_budgets(
             for c in group
             if not c.pinned and not budgets[c.condition_id].fits_minimum
         ]
-        if not broken:
+        churn = [c for c in group if _would_churn(c, budgets, group)]
+        if not broken and not churn:
             break
-        victim = min(broken, key=lambda c: (c.score, c.condition_id))
+        # Shed a fresh name before an incumbent. Adding a new market must not
+        # shrink a name we already quote until its own order would be cancelled.
+        fresh = [c for c in group if not c.pinned and c.condition_id not in previous]
+        if fresh and any(c.condition_id in previous for c in broken + churn):
+            victim = min(fresh, key=lambda c: (c.score, c.condition_id))
+        else:
+            pool = broken or churn
+            victim = min(pool, key=lambda c: (c.condition_id in previous, c.score, c.condition_id))
         group = [c for c in group if c.condition_id != victim.condition_id]
     else:
         budgets = alloc(group) if group else {}
@@ -494,7 +528,11 @@ def _fit_budgets(
         trial_budgets = alloc(trial)
         if not trial_budgets[cand.condition_id].fits_minimum:
             continue
+        if not slice_can_rearm(trial_budgets[cand.condition_id].buy_budget_usdc, cand.min_entry_notional):
+            continue
         if any(not trial_budgets[g.condition_id].fits_minimum and not g.pinned for g in group):
+            continue
+        if any(_would_churn(g, trial_budgets, trial) for g in trial):
             continue
         group = trial
         budgets = _release_unusable_pinned(group, alloc)

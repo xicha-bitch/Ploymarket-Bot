@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from polymaker.domain import Quote, Side
 
 _EPS = 1e-9
+# Float dust on a 5-share micro quote is well under one cent. A real cent
+# still rejects. 10.02 * 0.015 = 0.1503 vs headroom 0.150289 is this case.
+BUDGET_TOLERANCE_USDC = 0.001
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +138,7 @@ def allocate_buy_budgets(
         target = min(cap, max(soft, max(0.0, m.min_entry_notional)))
         if m.min_entry_notional > cap + _EPS:
             target = cap
-        fits = m.min_entry_notional <= target + _EPS
+        fits = m.min_entry_notional <= target + BUDGET_TOLERANCE_USDC
         return (BudgetSlice(m.condition_id, target, fits),)
 
     fair = pool / len(markets)
@@ -143,9 +146,41 @@ def allocate_buy_budgets(
     for m in markets:
         target = min(fair, _structural_room(m))
         target = max(0.0, target)
-        fits = m.min_entry_notional <= target + _EPS
+        fits = m.min_entry_notional <= target + BUDGET_TOLERANCE_USDC
         out.append(BudgetSlice(m.condition_id, target, fits))
     return tuple(out)
+
+
+def slice_can_rearm(slice_usdc: float, min_notional: float) -> bool:
+    """True when one minimum order fits and still leaves a minimum behind.
+
+    A minimum that consumes the slice is cancelled on the next pass: leftover
+    headroom is below another 5-share order, so the target goes empty.
+    """
+    if min_notional <= BUDGET_TOLERANCE_USDC:
+        return slice_usdc > BUDGET_TOLERANCE_USDC
+    return slice_usdc + BUDGET_TOLERANCE_USDC >= (2.0 * min_notional)
+
+
+def resting_quote_headroom(
+    *,
+    incremental_headroom: float | None,
+    own_resting_buy_usdc: float,
+    buy_budget_usdc: float | None,
+) -> float | None:
+    """Headroom for the desired resting quote, counting the order already live.
+
+    Place-headroom subtracts our own bid. That bid *is* the quote we want to
+    keep, so the next target must see it as part of the slice. Otherwise a
+    just-posted 5-share order looks unaffordable and reconcile cancels it.
+    """
+    if incremental_headroom is None and buy_budget_usdc is None:
+        return None
+    own = max(0.0, own_resting_buy_usdc)
+    full = own if incremental_headroom is None else incremental_headroom + own
+    if buy_budget_usdc is None:
+        return full
+    return min(full, max(0.0, buy_budget_usdc))
 
 
 def filter_quotes_to_budget(
@@ -172,11 +207,15 @@ def filter_quotes_to_budget(
                 f"drop_zero_notional side=BUY px={q.price:.4f} sz={q.size:.4f}"
             )
             continue
-        if cost <= remaining + _EPS:
+        if cost <= remaining + BUDGET_TOLERANCE_USDC:
             kept_buys.append(q)
             remaining -= cost
         else:
-            reason = "infeasible" if cost > headroom_usdc + _EPS else "exhausted"
+            reason = (
+                "infeasible"
+                if cost > headroom_usdc + BUDGET_TOLERANCE_USDC
+                else "exhausted"
+            )
             skipped.append(
                 f"budget_reject reason={reason} side=BUY px={q.price:.4f} sz={q.size:.4f} "
                 f"notional={cost:.4f} headroom_left={remaining:.4f}"

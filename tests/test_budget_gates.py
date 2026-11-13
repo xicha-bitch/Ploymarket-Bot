@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from polymaker.domain import Quote, Side
+from polymaker.domain import Position, Quote, Regime, Side
 from polymaker.strategy.budget import (
     filter_quotes_to_budget,
     place_headroom_usdc,
     quote_buy_notional,
+    resting_quote_headroom,
 )
 from polymaker.strategy.maker_gates import apply_min_size_clamp, is_min_size_feasible
 from polymaker.strategy.quoting import QuoteInputs, construct_quotes
 from tests.conftest import view
-from polymaker.domain import Position, Regime
 
 
 def test_apply_min_size_clamp_thin_uses_exchange_min_only(meta, profile):
@@ -100,6 +100,30 @@ def test_is_min_size_feasible():
     assert is_min_size_feasible(0.95, min_order_size=5.0, headroom_usdc=1.00) is False
     assert is_min_size_feasible(0.0, min_order_size=5.0, headroom_usdc=1.00) is True
     assert is_min_size_feasible(0.5, min_order_size=0.0, headroom_usdc=1.00) is True
+
+
+def test_budget_tolerance_keeps_sub_cent_dust():
+    # Live aliens reject: 10.02 * 0.015 = 0.1503 vs headroom 0.150289.
+    dust = Quote("tok", Side.BUY, 0.015, 10.02)
+    decision = filter_quotes_to_budget([dust], headroom_usdc=0.150289)
+    assert dust in decision.kept
+
+
+def test_budget_tolerance_still_rejects_a_real_shortfall():
+    expensive = Quote("tok", Side.BUY, 0.20, 5.0)  # $1.00 vs $0.15
+    decision = filter_quotes_to_budget([expensive], headroom_usdc=0.15)
+    assert decision.kept == ()
+    assert any("reason=infeasible" in s for s in decision.skipped)
+
+
+def test_resting_quote_headroom_counts_the_live_bid():
+    # API available already reserved the 0.47 bid, so incremental room is ~0.
+    # The target must still see that bid or the next pass cancels it.
+    assert resting_quote_headroom(
+        incremental_headroom=0.0,
+        own_resting_buy_usdc=0.47,
+        buy_budget_usdc=0.50,
+    ) == 0.47
 
 
 def test_filter_distinguishes_infeasible_vs_exhausted():

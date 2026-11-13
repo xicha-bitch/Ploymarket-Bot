@@ -7,7 +7,7 @@ import contextlib
 import time
 
 from polymaker.config import Config, PathsConfig, StrategyProfile
-from polymaker.domain import Side
+from polymaker.domain import OpenOrder, OrderState, Side
 from polymaker.engine import Engine
 from polymaker.strategy.regime import RegimeMachine
 from tests.stub_gateway import StubGateway
@@ -182,5 +182,19 @@ def test_allocated_headroom_caps_one_market(tmp_path, meta):
     headroom = eng._entry_headroom(meta)
     assert headroom is not None
     assert headroom <= 0.15 + 1e-9
+    eng.state.close()
+    eng.catalog.close()
+
+
+def test_entry_headroom_keeps_a_live_bid_in_the_slice(tmp_path, meta):
+    """API balance already reserved the bid; the target must still include it."""
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.selection.auto = True
+    eng._buy_budget[meta.condition_id] = 0.50
+    eng._collateral_usdc = 0.46
+    eng.state.upsert_order(OpenOrder("oid", meta.yes.token_id, Side.BUY, 0.094, 5.0, OrderState.LIVE))
+    headroom = eng._entry_headroom(meta)
+    assert headroom is not None
+    assert headroom + 1e-9 >= 0.47
     eng.state.close()
     eng.catalog.close()

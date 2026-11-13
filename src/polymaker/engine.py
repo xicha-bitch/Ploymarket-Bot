@@ -48,7 +48,11 @@ from polymaker.merge import Merger
 from polymaker.risk.manager import RiskManager
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
-from polymaker.strategy.budget import filter_quotes_to_budget, place_headroom_usdc
+from polymaker.strategy.budget import (
+    filter_quotes_to_budget,
+    place_headroom_usdc,
+    resting_quote_headroom,
+)
 from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
@@ -569,12 +573,16 @@ class Engine:
                 )
             )
         previous = [cid for cid in self.metas if cid not in self._exit_only]
+        # The CLOB available balance already reserves our resting bids. Add
+        # them back so a refresh does not shrink every slice and churn the
+        # set we just posted. Total-cap inside the allocator still binds.
+        our_resting = sum(self.risk.resting_buy_notional(m) for m in self.metas.values())
         planned = select_and_allocate(
             candidates,
             max_markets=sel.max_markets,
             previous_ids=previous,
             hysteresis_margin=sel.hysteresis_margin,
-            available_usdc=self._collateral_usdc,
+            available_usdc=self._collateral_usdc + our_resting,
             fee_buffer_usdc=_FEE_BUFFER_USDC,
             max_market_notional_usdc=self.cfg.risk.max_market_notional_usdc,
             max_event_group_loss_usdc=self.cfg.risk.max_event_group_loss_usdc,
@@ -1325,8 +1333,24 @@ class Engine:
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
-        plan = reconcile(tq, live, tick=meta.tick_size,
-                         reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
+        protect: dict[tuple[str, str], float] | None = None
+        if regime in (Regime.QUIET, Regime.TRENDING):
+            protect = {}
+            for quote in tq.quotes:
+                if quote.side is Side.BUY:
+                    protect[(quote.token_id, quote.side.value)] = quote.price
+            yes_touch = yes_book.best_bid()
+            if yes_touch is not None:
+                protect.setdefault((meta.yes.token_id, Side.BUY.value), yes_touch.price)
+            if no_book is not None:
+                no_touch = no_book.best_bid()
+                if no_touch is not None:
+                    protect.setdefault((meta.no.token_id, Side.BUY.value), no_touch.price)
+        plan = reconcile(
+            tq, live, tick=meta.tick_size,
+            reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac,
+            protect_bid_prices=protect,
+        )
         if plan.is_noop:
             self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
             return
@@ -1501,17 +1525,24 @@ class Engine:
         return min(headroom, room)
 
     def _entry_headroom(self, meta: MarketMeta) -> float | None:
-        """Headroom for construct_quotes. Exit-only markets get no BUY room."""
+        """Headroom for construct_quotes. Exit-only markets get no BUY room.
+
+        Own resting bids count toward the slice. Subtracting them makes the
+        order we just posted look too expensive, the target goes empty, and
+        reconcile cancels it.
+        """
         if meta.condition_id in self._exit_only:
             return 0.0
         live = self._current_headroom(meta)
-        if not self.cfg.selection.auto or meta.condition_id not in self._buy_budget:
-            return live
         resting = self.risk.resting_buy_notional(meta)
-        room = max(0.0, self._buy_budget[meta.condition_id] - resting)
-        if live is None:
-            return room
-        return min(live, room)
+        budget: float | None = None
+        if self.cfg.selection.auto and meta.condition_id in self._buy_budget:
+            budget = self._buy_budget[meta.condition_id]
+        return resting_quote_headroom(
+            incremental_headroom=live,
+            own_resting_buy_usdc=resting,
+            buy_budget_usdc=budget,
+        )
 
     def _current_headroom(self, meta: MarketMeta) -> float | None:
         """Best-effort place headroom from the last collateral snapshot (no I/O)."""

@@ -221,6 +221,49 @@ def test_config_loads_selection_switch(tmp_path) -> None:
     assert Config.load(bare, load_env=False).selection.auto is False
 
 
+def test_drops_market_whose_minimum_would_be_cancelled() -> None:
+    # Newsom 5 * 0.094 = $0.47 on a ~$0.50 two-name slice. Leftover cannot
+    # fund another 5-share order, so the next pass would cancel it.
+    planned = _plan(
+        candidates=[
+            _cand("iran", 2.0, minimum=0.08, pinned=True),
+            _cand("newsom", 3.0, minimum=0.47),
+        ],
+        max_markets=2,
+    )
+    ids = [p.condition_id for p in planned if p.role == "entry"]
+    assert ids == ["iran"]
+
+
+def test_cheap_minimums_can_rest_together() -> None:
+    planned = _plan(
+        candidates=[
+            _cand("a", 3.0, minimum=0.08),
+            _cand("b", 2.0, minimum=0.08),
+            _cand("c", 1.0, minimum=0.08),
+        ],
+        max_markets=3,
+    )
+    entries = [p for p in planned if p.role == "entry"]
+    assert [p.condition_id for p in entries] == ["a", "b", "c"]
+    assert sum(p.buy_budget_usdc for p in entries) <= 0.99 + 1e-9
+    # Each slice can hold the minimum and still re-quote it (2 * 0.08).
+    assert all(p.buy_budget_usdc + 1e-9 >= 0.16 for p in entries)
+
+
+def test_fresh_name_does_not_evict_a_resting_incumbent() -> None:
+    planned = _plan(
+        candidates=[
+            _cand("keep", 1.0, minimum=0.30),
+            _cand("fresh", 1.2, minimum=0.10),
+        ],
+        previous_ids=["keep"],
+        max_markets=2,
+    )
+    ids = [p.condition_id for p in planned if p.role == "entry"]
+    assert ids == ["keep"]
+
+
 def test_allocation_spreads_and_respects_caps() -> None:
     three = _plan(
         candidates=[_cand("a", 3.0), _cand("b", 2.0), _cand("c", 1.0)],

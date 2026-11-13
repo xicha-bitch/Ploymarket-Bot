@@ -213,11 +213,12 @@ def test_handle_chat_replies_chinese() -> None:
     assert len(replies) == 7
     assert "交易通知机器人" in replies[0]
     assert "/status" in replies[0]
-    assert "交易通知机器人" in replies[1]
-    assert "交易通知机器人" in replies[2]
-    assert "交易通知机器人" in replies[3]
-    assert "不会查天气" in replies[4]
-    assert "/help" in replies[5]
+    assert "TELEGRAM_NOTIFY=quiet" in replies[0]
+    assert "/status" in replies[1]
+    assert "/status" in replies[2]
+    assert "/status" in replies[3]
+    assert "不查天气" in replies[4]
+    assert "/help" in replies[5] or "/status" in replies[5]
     assert "交易通知机器人" in replies[6]
 
 

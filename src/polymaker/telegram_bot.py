@@ -467,16 +467,12 @@ class TelegramBot:
     @staticmethod
     def _help_text() -> str:
         return (
-            "你好，我是 Polymarket 交易通知机器人。\n\n"
-            "命令：\n"
-            "/status — 余额、挂单、仓位、成交、会话记账\n"
-            "/pnl — 会话记账（非正式账户总资产）\n"
-            "/stop — 暂停新下单（不批量撤单）\n"
-            "/help — 本说明\n\n"
-            "也可发「hi」「在吗」「跟我聊天」测连通；"
-            "不查天气，交易状态请用 /status。\n\n"
-            "默认安静：不主动推送周期状态或下单噪音。"
-            "需要成交推送时设 TELEGRAM_NOTIFY=fills。"
+            "Polymarket 交易通知机器人\n"
+            "/status 余额挂单仓位\n"
+            "/pnl 会话记账\n"
+            "/stop 暂停新下单\n"
+            "/help 本说明\n"
+            "默认安静（TELEGRAM_NOTIFY=quiet）；成交推送设 fills。"
         )
 
     @staticmethod
@@ -507,7 +503,7 @@ class TelegramBot:
                 await self.send(f"📈 会话记账\n{body}")
             elif cmd == "/stop":
                 self.stop_requested = True
-                await self.send("🛑 已请求停止 — 暂停新下单（挂单保留，不批量撤单）")
+                await self.send("🛑 已暂停新下单（挂单保留）")
                 if self._on_stop is not None:
                     result = self._on_stop()
                     if asyncio.iscoroutine(result):
@@ -518,14 +514,11 @@ class TelegramBot:
 
         norm = self._normalize_chat_text(text)
         if norm in ("hi", "hello", "hey", "在吗", "在么", "在不在", "跟我聊天", "聊天"):
-            await self.send(
-                "在的 🙂 我是交易通知机器人，不是闲聊助手。"
-                "要看交易状态发 /status，更多命令 /help。"
-            )
+            await self.send("在的。看状态发 /status，命令 /help。")
         elif "天气" in norm:
-            await self.send("我不会查天气～这是交易通知机器人。看交易状态请发 /status。")
+            await self.send("不查天气。看状态发 /status。")
         else:
-            await self.send("没听懂。试试 /help，或发 /status 看交易状态。")
+            await self.send("未识别。试试 /help 或 /status。")
 
     async def _call_provider(self, provider: StatusProvider | PnlProvider | None) -> str:
         if provider is None:

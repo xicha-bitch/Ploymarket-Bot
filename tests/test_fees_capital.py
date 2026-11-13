@@ -75,20 +75,98 @@ def test_micro_auto_allows_market_and_base_within_bankroll() -> None:
     assert report.ok, report.warnings
 
 
-def test_micro_auto_still_rejects_total_and_daily_over_bankroll() -> None:
+def test_micro_auto_allows_daily_kill_up_to_bankroll() -> None:
+    """Losing the ~$1 book is accepted. Do not force a $0.20 stop."""
     cfg = Config(
         risk=RiskConfig(
-            max_total_exposure_usdc=1.5,
-            max_event_group_loss_usdc=1.0,
+            max_total_exposure_usdc=1.0,
+            max_event_group_loss_usdc=0.95,
             max_market_notional_usdc=1.0,
-            daily_loss_kill_usdc=0.4,
+            daily_loss_kill_usdc=1.0,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.95, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=True, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert report.ok, report.warnings
+
+
+def test_micro_auto_five_dollar_book_allows_full_kill() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=5.0,
+            max_event_group_loss_usdc=4.5,
+            max_market_notional_usdc=5.0,
+            daily_loss_kill_usdc=5.0,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=1.0, q_max_usdc=5.0)},
+        selection=SelectionConfig(auto=True, max_markets=2),
+    )
+    assert assess_capital(cfg, 5.0).ok
+
+
+def test_micro_auto_rejects_daily_kill_above_bankroll() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.0,
+            max_event_group_loss_usdc=0.95,
+            max_market_notional_usdc=1.0,
+            daily_loss_kill_usdc=1.01,
         ),
         profiles={"micro-tight": StrategyProfile(base_size_usdc=0.25, q_max_usdc=0.95)},
         selection=SelectionConfig(auto=True, max_markets=4),
     )
     report = assess_capital(cfg, 1.0)
     assert not report.ok
+    assert any("daily_loss_kill_usdc" in w for w in report.warnings)
+
+
+def test_micro_auto_still_rejects_total_above_bankroll() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.5,
+            max_event_group_loss_usdc=1.0,
+            max_market_notional_usdc=1.0,
+            daily_loss_kill_usdc=1.0,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.95, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=True, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert not report.ok
     assert any("max_total_exposure_usdc" in w for w in report.warnings)
+    assert not any("daily_loss_kill_usdc" in w for w in report.warnings)
+
+
+def test_above_micro_book_keeps_quarter_daily_kill() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=6.0,
+            max_event_group_loss_usdc=4.0,
+            max_market_notional_usdc=3.0,
+            daily_loss_kill_usdc=5.0,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=1.0, q_max_usdc=3.0)},
+        selection=SelectionConfig(auto=True, max_markets=4),
+    )
+    report = assess_capital(cfg, 6.0)
+    assert not report.ok
+    assert any("daily_loss_kill_usdc" in w for w in report.warnings)
+
+
+def test_micro_without_auto_keeps_quarter_daily_kill() -> None:
+    cfg = Config(
+        risk=RiskConfig(
+            max_total_exposure_usdc=1.0,
+            max_event_group_loss_usdc=0.95,
+            max_market_notional_usdc=0.60,
+            daily_loss_kill_usdc=1.0,
+        ),
+        profiles={"micro-tight": StrategyProfile(base_size_usdc=0.25, q_max_usdc=0.95)},
+        selection=SelectionConfig(auto=False, max_markets=4),
+    )
+    report = assess_capital(cfg, 1.0)
+    assert not report.ok
     assert any("daily_loss_kill_usdc" in w for w in report.warnings)
 
 

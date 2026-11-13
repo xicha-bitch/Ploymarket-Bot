@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from polymaker.config import StrategyProfile
 from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQuotes
 from polymaker.marketdata.orderbook import BookView
+from polymaker.strategy.budget import BUDGET_TOLERANCE_USDC
 from polymaker.strategy.maker_gates import (
     apply_min_size_clamp,
     is_min_size_feasible,
@@ -70,7 +71,8 @@ class QuoteInputs:
     no_exit_urgency: float = 0.0
     headroom_usdc: float | None = None
     # When set, size BUY orders to this notional instead of profile.base_size_usdc.
-    # The engine sets it only while auto-selection is spreading across 2+ markets.
+    # Auto-selection sets it to the market's slice, including a lone market,
+    # so a $0.25 profile clip does not leave the allocated cash unposted.
     size_notional_usdc: float | None = None
 
 
@@ -92,6 +94,9 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     u = _clamp(net_shares / q_max_shares, -1.0, 1.0) if q_max_shares > 0 else 0.0
     reward_floor = m.rewards_min_size * p.reward_size_mult  # scoring size w/ margin
     size_notional = p.base_size_usdc if inp.size_notional_usdc is None else inp.size_notional_usdc
+    # An explicit slice is cash we intend to post. A thin book must not
+    # shrink it back to a 5-share dust bid and leave the rest idle.
+    deploy_slice = inp.size_notional_usdc is not None
 
     skew = p.gamma * inp.vol_short * u
 
@@ -132,8 +137,13 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
         if price is not None and is_min_size_feasible(
             price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
         ):
-            raw = _size_shares(size_notional, price, common_scale * (1 - max(u, 0.0)), m)
-            sized = apply_min_size_clamp(raw, scale=yes_book_scale, meta=m, profile=p)
+            leg = notional_covering_minimum(
+                size_notional, price, m.min_order_size, inp.headroom_usdc
+            )
+            raw = _size_shares(leg, price, common_scale * (1 - max(u, 0.0)), m)
+            sized = apply_min_size_clamp(
+                raw, scale=1.0 if deploy_slice else yes_book_scale, meta=m, profile=p
+            )
             before = len(quotes)
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
                         sized, p.layers, p.layer_step_ticks, down=True,
@@ -148,8 +158,13 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
         if price is not None and is_min_size_feasible(
             price, min_order_size=m.min_order_size, headroom_usdc=inp.headroom_usdc
         ):
-            raw = _size_shares(size_notional, price, common_scale * (1 - max(-u, 0.0)), m)
-            sized = apply_min_size_clamp(raw, scale=no_book_scale, meta=m, profile=p)
+            leg = notional_covering_minimum(
+                size_notional, price, m.min_order_size, inp.headroom_usdc
+            )
+            raw = _size_shares(leg, price, common_scale * (1 - max(-u, 0.0)), m)
+            sized = apply_min_size_clamp(
+                raw, scale=1.0 if deploy_slice else no_book_scale, meta=m, profile=p
+            )
             before = len(quotes)
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
                         sized, p.layers, p.layer_step_ticks, down=True,
@@ -207,6 +222,25 @@ def _place_bid(
     if p <= 0 or p >= 1:
         return None
     return p
+
+
+def notional_covering_minimum(
+    size_notional: float,
+    price: float,
+    min_order_size: float,
+    headroom_usdc: float | None,
+) -> float:
+    """Raise a base-size clip when one exchange-minimum order costs more.
+
+    A $0.25 base cannot post 5 shares at $0.10 ($0.50). Use that minimum
+    notional when headroom can pay for it. Do not exceed headroom.
+    """
+    floor = max(0.0, min_order_size) * max(0.0, price)
+    if floor <= size_notional + BUDGET_TOLERANCE_USDC:
+        return size_notional
+    if headroom_usdc is not None and floor > headroom_usdc + BUDGET_TOLERANCE_USDC:
+        return size_notional
+    return floor
 
 
 def _size_shares(base_usdc: float, price: float, scale: float, m: MarketMeta) -> float:

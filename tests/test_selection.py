@@ -221,18 +221,25 @@ def test_config_loads_selection_switch(tmp_path) -> None:
     assert Config.load(bare, load_env=False).selection.auto is False
 
 
-def test_drops_market_whose_minimum_would_be_cancelled() -> None:
-    # Newsom 5 * 0.094 = $0.47 on a ~$0.50 two-name slice. Leftover cannot
-    # fund another 5-share order, so the next pass would cancel it.
+def test_minimum_above_quarter_stays_with_a_cheap_market() -> None:
+    # Newsom 5 * 0.094 = $0.47. That is more than a $0.25 clip and more than
+    # an equal half of a two-name book, and the cheap name still gets a bid.
     planned = _plan(
         candidates=[
             _cand("iran", 2.0, minimum=0.08, pinned=True),
             _cand("newsom", 3.0, minimum=0.47),
         ],
         max_markets=2,
+        max_market_notional_usdc=1.0,
     )
-    ids = [p.condition_id for p in planned if p.role == "entry"]
-    assert ids == ["iran"]
+    entries = [p for p in planned if p.role == "entry"]
+    ids = {p.condition_id for p in entries}
+    assert ids == {"iran", "newsom"}
+    newsom = next(p for p in entries if p.condition_id == "newsom")
+    assert newsom.scale_to_budget
+    assert newsom.buy_budget_usdc > 0.25
+    assert newsom.buy_budget_usdc + 1e-9 >= 0.47
+    assert sum(p.buy_budget_usdc for p in entries) > 0.90
 
 
 def test_cheap_minimums_can_rest_together() -> None:
@@ -247,21 +254,27 @@ def test_cheap_minimums_can_rest_together() -> None:
     entries = [p for p in planned if p.role == "entry"]
     assert [p.condition_id for p in entries] == ["a", "b", "c"]
     assert sum(p.buy_budget_usdc for p in entries) <= 0.99 + 1e-9
-    # Each slice can hold the minimum and still re-quote it (2 * 0.08).
+    assert sum(p.buy_budget_usdc for p in entries) > 0.90
+    # Leftover cash is spread, so each slice is more than the $0.08 minimum.
     assert all(p.buy_budget_usdc + 1e-9 >= 0.16 for p in entries)
 
 
 def test_fresh_name_does_not_evict_a_resting_incumbent() -> None:
+    # Both minimums cannot share the dollar. The resting name keeps its slice.
     planned = _plan(
         candidates=[
-            _cand("keep", 1.0, minimum=0.30),
-            _cand("fresh", 1.2, minimum=0.10),
+            _cand("keep", 1.0, minimum=0.70),
+            _cand("fresh", 1.2, minimum=0.40),
         ],
         previous_ids=["keep"],
         max_markets=2,
+        max_market_notional_usdc=1.0,
     )
     ids = [p.condition_id for p in planned if p.role == "entry"]
     assert ids == ["keep"]
+    keep = next(p for p in planned if p.condition_id == "keep")
+    assert keep.scale_to_budget
+    assert keep.buy_budget_usdc > 0.25
 
 
 def test_allocation_spreads_and_respects_caps() -> None:
@@ -290,10 +303,10 @@ def test_allocation_spreads_and_respects_caps() -> None:
         lone_market_fraction=0.60,
     )
     assert len(lone) == 1
-    assert 0.59 <= lone[0].buy_budget_usdc <= 0.60
-    assert lone[0].buy_budget_usdc < 0.99
+    # Market cap binds. The old 60% soft clip of the $0.99 pool does not.
+    assert abs(lone[0].buy_budget_usdc - 0.60) < 1e-9
 
-    # Minimum above 60% is allowed only up to the structural cap.
+    # A lone name uses the pool, not just its 5-share minimum.
     raised = allocate_buy_budgets(
         [BudgetSliceInput("only", "e", min_entry_notional=0.75)],
         available_usdc=1.0,
@@ -303,8 +316,9 @@ def test_allocation_spreads_and_respects_caps() -> None:
         max_total_exposure_usdc=1.0,
         filled_total_usdc=0.0,
     )
-    assert abs(raised[0].buy_budget_usdc - 0.75) < 1e-9
+    assert abs(raised[0].buy_budget_usdc - 0.99) < 1e-9
     assert raised[0].fits_minimum
+    assert raised[0].buy_budget_usdc > 0.25
 
     same_event = allocate_buy_budgets(
         [

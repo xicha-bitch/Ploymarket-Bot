@@ -1,5 +1,5 @@
-# Official live-micro strategy sizes. Intentional 0.25 / 0.9 caps for the
-# current small-capital live run. Do not enlarge to the generic config/strategy.toml
+# Official live-micro strategy sizes for the ~$1 book. base/q_max sit at 0.95
+# so a quote is not clipped at $0.25. Do not copy the generic config/strategy.toml
 # micro-tight 2.5 / 6.0 or micro-capital 4.0 / 10.0 defaults.
 
 [profiles.micro-capital]
@@ -11,8 +11,8 @@ c_vol                = 1.5
 c_tox                = 3.0
 vol_short_halflife_s = 10
 vol_long_halflife_s  = 900
-base_size_usdc       = 0.25
-q_max_usdc           = 0.9
+base_size_usdc       = 0.95
+q_max_usdc           = 0.95
 q_soft_frac          = 0.5
 layers               = 1
 reward_size_mult     = 1.0
@@ -44,8 +44,8 @@ c_vol                = 2.0
 c_tox                = 3.5
 vol_short_halflife_s = 10
 vol_long_halflife_s  = 900
-base_size_usdc       = 0.25
-q_max_usdc           = 0.9
+base_size_usdc       = 0.95
+q_max_usdc           = 0.95
 q_soft_frac          = 0.5
 layers               = 1
 reward_size_mult     = 1.0

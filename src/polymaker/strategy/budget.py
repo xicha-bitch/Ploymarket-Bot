@@ -94,11 +94,14 @@ def allocate_buy_budgets(
     Own resting on these markets is replaceable, so it is not subtracted
     again here; the quoter subtracts whatever is still live.
 
-    Two or more markets get equal shares. A clipped cap (market / event /
-    total) does not donate the leftover to a sibling — that would dump the
-    book into one name. A single market is capped at ``lone_market_fraction``
-    of the pool unless its exchange minimum is larger, and still cannot
-    exceed market, event, total, or cash.
+    Each market is funded to its exchange minimum first, even when that
+    minimum is larger than an equal share or a $0.25 base clip. Leftover
+    cash is then spread into whatever room the market and event caps still
+    allow, so several cheap names stay on the book and the pool is not left
+    idle. A clipped cap does not donate past that cap.
+
+    A single market receives the whole pool up to those caps.
+    ``lone_market_fraction`` is kept for callers and does not withhold cash.
     """
     pool_cash = max(
         0.0,
@@ -117,49 +120,99 @@ def allocate_buy_budgets(
             for m in markets
         )
 
-    groups: dict[str, list[BudgetSliceInput]] = {}
-    for m in markets:
-        groups.setdefault(m.event_id or m.condition_id, []).append(m)
+    groups: dict[str, list[int]] = {}
+    for i, m in enumerate(markets):
+        groups.setdefault(m.event_id or m.condition_id, []).append(i)
 
-    def _structural_room(m: BudgetSliceInput) -> float:
-        market_room = max(0.0, max_market_notional_usdc - max(0.0, m.filled_usdc))
-        sibs = groups[m.event_id or m.condition_id]
-        event_filled = sum(max(0.0, s.filled_usdc) for s in sibs)
-        event_room = max(0.0, max_event_group_loss_usdc - event_filled)
-        event_share = event_room / len(sibs)
-        return max(0.0, min(market_room, event_share))
+    def _market_room(m: BudgetSliceInput) -> float:
+        return max(0.0, max_market_notional_usdc - max(0.0, m.filled_usdc))
+
+    def _event_room(key: str) -> float:
+        filled = sum(max(0.0, markets[i].filled_usdc) for i in groups[key])
+        return max(0.0, max_event_group_loss_usdc - filled)
+
+    market_rooms = [_market_room(m) for m in markets]
+    event_rooms = {key: _event_room(key) for key in groups}
+
+    del lone_market_fraction  # caps decide the lone size; do not withhold cash
 
     if len(markets) == 1:
         m = markets[0]
-        cap = min(pool, _structural_room(m))
-        soft = pool * min(1.0, max(0.0, lone_market_fraction))
-        # Raise toward the exchange minimum only when that is what makes a
-        # post possible; never past the structural cap.
-        target = min(cap, max(soft, max(0.0, m.min_entry_notional)))
-        if m.min_entry_notional > cap + _EPS:
-            target = cap
-        fits = m.min_entry_notional <= target + BUDGET_TOLERANCE_USDC
-        return (BudgetSlice(m.condition_id, target, fits),)
+        key = m.event_id or m.condition_id
+        cap = min(pool, market_rooms[0], event_rooms[key])
+        fits = m.min_entry_notional <= cap + BUDGET_TOLERANCE_USDC
+        return (BudgetSlice(m.condition_id, cap, fits),)
 
+    funded = _fund_minimums_then_leftover(
+        markets, market_rooms, groups, event_rooms, pool
+    )
+    if funded is not None:
+        return funded
+
+    # The set cannot all meet their minimums. Equal shares (still inside
+    # each cap) let the selector drop the name that does not fit.
     fair = pool / len(markets)
     out: list[BudgetSlice] = []
-    for m in markets:
-        target = min(fair, _structural_room(m))
-        target = max(0.0, target)
+    for i, m in enumerate(markets):
+        key = m.event_id or m.condition_id
+        event_share = event_rooms[key] / len(groups[key])
+        target = max(0.0, min(fair, market_rooms[i], event_share))
         fits = m.min_entry_notional <= target + BUDGET_TOLERANCE_USDC
         out.append(BudgetSlice(m.condition_id, target, fits))
     return tuple(out)
 
 
-def slice_can_rearm(slice_usdc: float, min_notional: float) -> bool:
-    """True when one minimum order fits and still leaves a minimum behind.
+def _fund_minimums_then_leftover(
+    markets: list[BudgetSliceInput] | tuple[BudgetSliceInput, ...],
+    market_rooms: list[float],
+    groups: dict[str, list[int]],
+    event_rooms: dict[str, float],
+    pool: float,
+) -> tuple[BudgetSlice, ...] | None:
+    """Give every name its minimum, then spread leftover up to the caps.
 
-    A minimum that consumes the slice is cancelled on the next pass: leftover
-    headroom is below another 5-share order, so the target goes empty.
+    A minimum may be larger than an equal share. Sibling names in one event
+    still cannot sum past the event cap. Returns None when the set cannot
+    all be funded, so the caller can drop the name that does not fit.
     """
-    if min_notional <= BUDGET_TOLERANCE_USDC:
-        return slice_usdc > BUDGET_TOLERANCE_USDC
-    return slice_usdc + BUDGET_TOLERANCE_USDC >= (2.0 * min_notional)
+    n = len(markets)
+    needs = [max(0.0, m.min_entry_notional) for m in markets]
+    if any(needs[i] > market_rooms[i] + BUDGET_TOLERANCE_USDC for i in range(n)):
+        return None
+    for key, idxs in groups.items():
+        if sum(needs[i] for i in idxs) > event_rooms[key] + BUDGET_TOLERANCE_USDC:
+            return None
+    if sum(needs) > pool + BUDGET_TOLERANCE_USDC:
+        return None
+    alloc = list(needs)
+    leftover = pool - sum(needs)
+    if leftover > _EPS:
+        market_spare = [max(0.0, market_rooms[i] - alloc[i]) for i in range(n)]
+        effective = [0.0] * n
+        for key, idxs in groups.items():
+            spare_sum = sum(market_spare[i] for i in idxs)
+            event_spare = event_rooms[key] - sum(alloc[i] for i in idxs)
+            if spare_sum <= _EPS or event_spare <= _EPS:
+                continue
+            scale = min(1.0, event_spare / spare_sum)
+            for i in idxs:
+                effective[i] = market_spare[i] * scale
+        spare_sum = sum(effective)
+        if spare_sum > _EPS:
+            if leftover <= spare_sum + _EPS:
+                for i in range(n):
+                    alloc[i] += leftover * (effective[i] / spare_sum)
+            else:
+                for i in range(n):
+                    alloc[i] += effective[i]
+            for i in range(n):
+                alloc[i] = min(alloc[i], market_rooms[i])
+    out: list[BudgetSlice] = []
+    for i, m in enumerate(markets):
+        target = max(0.0, alloc[i])
+        fits = needs[i] <= target + BUDGET_TOLERANCE_USDC
+        out.append(BudgetSlice(m.condition_id, target, fits))
+    return tuple(out)
 
 
 def resting_quote_headroom(

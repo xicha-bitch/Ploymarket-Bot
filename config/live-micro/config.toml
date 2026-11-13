@@ -23,11 +23,12 @@ journal = true
 loop = "uvloop"
 
 [risk]
-# Intentional micro-live caps. Not a bug, not a temporary typo, do not enlarge.
+# ~$1 live book. The operator accepts losing this principal. A 5-share
+# minimum may use the dollar; total exposure still cannot exceed it.
 max_total_exposure_usdc = 1.0
-max_event_group_loss_usdc = 0.8
-max_market_notional_usdc = 0.55
-daily_loss_kill_usdc = 0.2
+max_event_group_loss_usdc = 0.95
+max_market_notional_usdc = 1.0
+daily_loss_kill_usdc = 1.0
 ws_stale_halt_s = 10.0
 user_ws_blind_halt_s = 15.0
 heartbeat_halt_failures = 3
@@ -44,8 +45,8 @@ journal_dir = "journal"
 log_dir = "logs"
 
 [selection]
-# Rotate across several feasible markets and spread the ~$1 book.
-# Explicit [[markets]] rows stay pinned. Risk caps above are unchanged.
+# Rotate across several feasible markets and spend the ~$1 book.
+# Explicit [[markets]] rows stay pinned. Risk caps above are the live targets.
 auto = true
 max_markets = 4
 profile = "micro-tight"

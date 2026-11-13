@@ -68,6 +68,28 @@ class PathsConfig(BaseModel):
     log_dir: str = "logs"
 
 
+class SelectionConfig(BaseModel):
+    """Automatic multi-market rotation. Off unless ``[selection] auto = true``.
+
+    Explicit ``markets.toml`` rows stay pinned. ``max_markets`` counts pinned
+    and auto names together; inventory that cannot be dropped is extra and
+    exit-only.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    auto: bool = False
+    max_markets: int = Field(default=4, ge=1)
+    hysteresis_margin: float = Field(default=0.15, ge=0.0)
+    min_hours_to_end: float = Field(default=6.0, ge=0.0)
+    min_liquidity: float = 0.0
+    rewards_only: bool = False
+    profile: str = "micro-tight"
+    tag_slug: str = "politics"
+    max_pages: int = Field(default=4, ge=1, le=25)
+    lone_market_fraction: float = Field(default=0.60, gt=0.0, le=1.0)
+
+
 class StrategyProfile(BaseModel):
     """One named parameter set. Every knob the quoter uses lives here."""
 
@@ -220,6 +242,7 @@ class Config(BaseModel):
     paths: PathsConfig = PathsConfig()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
+    selection: SelectionConfig = Field(default_factory=SelectionConfig)
     secrets: Secrets = Field(default_factory=Secrets)
     config_dir: Path = Path("config")
 
@@ -263,6 +286,7 @@ class Config(BaseModel):
             paths=PathsConfig(**main.get("paths", {})),
             profiles=profiles,
             markets=markets,
+            selection=SelectionConfig(**main.get("selection", {})),
             secrets=Secrets(),
             config_dir=cdir,
         )

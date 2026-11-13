@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS tags (
     tag_id TEXT NOT NULL,
     ts     REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS active_selection (
+    condition_id TEXT PRIMARY KEY,
+    role         TEXT NOT NULL,
+    updated_ts   REAL NOT NULL
+);
 """
 
 
@@ -144,6 +150,25 @@ class CatalogStore:
             (slug, tag_id, time.time()),
         )
         self._conn.commit()
+
+    def save_active_selection(self, rows: list[tuple[str, str]]) -> None:
+        """Replace the persisted entry/exit-only set (restart keeps inventory)."""
+        self._conn.execute("DELETE FROM active_selection")
+        now = time.time()
+        self._conn.executemany(
+            "INSERT INTO active_selection(condition_id, role, updated_ts) VALUES(?,?,?)",
+            [(cid, role, now) for cid, role in rows],
+        )
+        self._conn.commit()
+
+    def load_active_selection(self) -> list[tuple[str, str]]:
+        try:
+            rows = self._conn.execute(
+                "SELECT condition_id, role FROM active_selection ORDER BY condition_id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(str(row["condition_id"]), str(row["role"])) for row in rows]
 
     def cached_tag(self, slug: str) -> str | None:
         row = self._conn.execute("SELECT tag_id FROM tags WHERE slug=?", (slug,)).fetchone()

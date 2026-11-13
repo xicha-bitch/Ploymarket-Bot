@@ -151,6 +151,27 @@ def test_reconcile_resizes_when_size_drifts():
     assert len(plan.to_place) == 1
 
 
+def test_reconcile_keeps_buy_when_price_has_not_moved():
+    tq = TargetQuotes("cid", Regime.QUIET, ())
+    live = [_live("o1", "tok", Side.BUY, 0.094, 5)]
+    plan = reconcile(
+        tq, live, tick=0.001, reprice_ticks=3, resize_frac=0.3,
+        protect_bid_prices={("tok", "BUY"): 0.094},
+    )
+    assert plan.to_cancel == []
+    assert plan.to_place == []
+
+
+def test_reconcile_cancels_buy_when_price_moves_past_reprice():
+    tq = TargetQuotes("cid", Regime.QUIET, ())
+    live = [_live("o1", "tok", Side.BUY, 0.094, 5)]
+    plan = reconcile(
+        tq, live, tick=0.001, reprice_ticks=3, resize_frac=0.3,
+        protect_bid_prices={("tok", "BUY"): 0.080},
+    )
+    assert plan.to_cancel == ["o1"]
+
+
 def test_reconcile_cancels_all_when_target_empty():
     tq = TargetQuotes("cid", Regime.EVENT, ())
     live = [_live("o1", "tok", Side.BUY, 0.49, 100), _live("o2", "tok", Side.SELL, 0.55, 50)]

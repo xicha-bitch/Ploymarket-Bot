@@ -138,6 +138,7 @@ class Engine:
         self._recovery_blocked: bool = False
         self._trades_backfill_ok: bool = False
         self._last_trades_ok_ts: float = 0.0
+        self._positions_requote_pending: bool = False
         self._session_start_ts: float = time.time()
         # Auto-selection. Pinned ids come from markets.toml. Exit-only names
         # still have inventory and must not be given new BUY budget.
@@ -922,7 +923,10 @@ class Engine:
         # Only treat traded tokens we care about as coverage gaps.
         missing_ours = [m for m in missing if str(m["token_id"]) in self._token_cid]
         coverage_complete = len(missing_ours) == 0
+        trades_were_ok = self._trades_backfill_ok
         self._trades_backfill_ok = coverage_complete
+        if coverage_complete and not trades_were_ok:
+            self._maybe_requote_after_recovery_gate(reason="trades_backfill_ok")
         if coverage_complete:
             self._last_trades_ok_ts = time.time()
             log.info(
@@ -1024,7 +1028,31 @@ class Engine:
                 positions_ok=positions_ok,
                 orders_ok=orders_ok,
             )
+        if authoritative_ok:
+            self._maybe_requote_after_recovery_gate(reason=f"authoritative_resync:{reason}")
         return authoritative_ok
+
+    def _recovery_blind(self) -> bool:
+        """True while positions/trades authority forbids new quotes."""
+        return (
+            self._recovery_blocked
+            or not self._positions_healthy
+            or (self._user_started and not self._trades_backfill_ok and self.user is not None)
+        )
+
+    def _maybe_requote_after_recovery_gate(self, *, reason: str) -> None:
+        """After a transient 429/blind spell, repost when authority is healthy again."""
+        if self._recovery_blind():
+            if reason.startswith("positions"):
+                self._positions_requote_pending = True
+            return
+        pending = self._positions_requote_pending
+        self._positions_requote_pending = False
+        if pending or reason.startswith(
+            ("positions", "trades_backfill", "authoritative", "forced_reconcile")
+        ):
+            log.info("recovery_requote", reason=reason, was_pending=pending)
+            self._wake_all()
 
     # ── callbacks ───────────────────────────────────────────────────────
     def _on_dirty(self, condition_id: str, token_id: str) -> None:
@@ -1250,11 +1278,7 @@ class Engine:
         # Do not place new quotes while positions/trades authority is unknown or
         # a disconnect recovery is still incomplete (prevents duplicate orders /
         # duplicate fill accounting).
-        recovery_blind = (
-            self._recovery_blocked
-            or not self._positions_healthy
-            or (self._user_started and not self._trades_backfill_ok and self.user is not None)
-        )
+        recovery_blind = self._recovery_blind()
         halted = cid in self._halted
         blind = market_stale or user_blind or hb_blind or halted or recovery_blind
         if blind:
@@ -1796,6 +1820,7 @@ class Engine:
                         )
                         positions = None
                         reconcile_status = "fail"
+                        self._wake_all()
                     else:
                         was_unhealthy = not self._positions_healthy
                         self._positions_fail_streak = 0
@@ -1804,8 +1829,9 @@ class Engine:
                         self._last_reconcile_ok_ts = time.time()
                         if was_unhealthy:
                             log.info("positions_reconcile_recovered")
-                            # Resume normal cadence; wake quoters so exits refresh.
-                            self._wake_all()
+                            self._maybe_requote_after_recovery_gate(
+                                reason="positions_reconcile_recovered"
+                            )
                 if positions is not None:
                     # Empty dict is a valid complete snapshot and must zero stale locals.
                     deltas = self.state.reconcile_positions(positions, is_snapshot=True)
@@ -1845,6 +1871,9 @@ class Engine:
                     if authoritative_ok:
                         self._recovery_blocked = False
                         self.risk.try_clear_false_daily_loss(authoritative_ok=True)
+                        self._maybe_requote_after_recovery_gate(
+                            reason="forced_reconcile_authoritative_ok"
+                        )
                     else:
                         self._recovery_blocked = True
                     log.info(

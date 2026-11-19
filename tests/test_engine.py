@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import time
 
+import pytest
+
 from polymaker.config import Config, PathsConfig, StrategyProfile
-from polymaker.domain import OpenOrder, OrderState, Side
+from polymaker.domain import OpenOrder, OrderState, Quote, Side
 from polymaker.engine import Engine
 from polymaker.strategy.regime import RegimeMachine
 from tests.stub_gateway import StubGateway
@@ -198,3 +200,59 @@ def test_entry_headroom_keeps_a_live_bid_in_the_slice(tmp_path, meta):
     assert headroom + 1e-9 >= 0.47
     eng.state.close()
     eng.catalog.close()
+
+
+async def test_refresh_collateral_keeps_last_good_on_failed_read(tmp_path, meta):
+    """Failed balance/allowance must not write available=0 and starve quoting."""
+
+    class FailBal(StubGateway):
+        async def collateral_balance(self):
+            return None
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway = FailBal()  # type: ignore[assignment]
+    eng._collateral_usdc = 1.005867
+    eng._collateral_ts = 0.0  # force refresh
+    kept = await eng._refresh_collateral(force=True)
+    assert kept == pytest.approx(1.005867)
+    assert eng._collateral_usdc == pytest.approx(1.005867)
+
+    # Budget filter still sees last-good cash (not a false zero).
+    q = Quote(meta.yes.token_id, Side.BUY, 0.10, 5.0)
+    kept_quotes = await eng._budget_filter_quotes(meta.condition_id, meta, [q])
+    assert kept_quotes == [q]
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_refresh_collateral_writes_real_zero_and_fails_closed_without_prior(
+    tmp_path, meta
+):
+    class ZeroBal(StubGateway):
+        async def collateral_balance(self):
+            return 0.0
+
+    class FailBal(StubGateway):
+        async def collateral_balance(self):
+            return None
+
+    eng = _engine_with_market(tmp_path, meta)
+    # Successful zero is authoritative.
+    eng.gateway = ZeroBal()  # type: ignore[assignment]
+    eng._collateral_usdc = 1.0
+    eng._collateral_ts = 0.0
+    assert await eng._refresh_collateral(force=True) == 0.0
+    assert eng._collateral_usdc == 0.0
+
+    # No prior snapshot + failed read → stay None → skip place (fail closed).
+    eng2 = _engine_with_market(tmp_path, meta)
+    eng2.gateway = FailBal()  # type: ignore[assignment]
+    eng2._collateral_usdc = None
+    eng2._collateral_ts = 0.0
+    assert await eng2._refresh_collateral(force=True) is None
+    q = Quote(meta.yes.token_id, Side.BUY, 0.10, 5.0)
+    assert await eng2._budget_filter_quotes(meta.condition_id, meta, [q]) == []
+    eng.state.close()
+    eng.catalog.close()
+    eng2.state.close()
+    eng2.catalog.close()

@@ -1477,7 +1477,12 @@ class Engine:
         self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
 
     async def _refresh_collateral(self, *, force: bool = False) -> float | None:
-        """Refresh CLOB collateral snapshot (no secrets logged)."""
+        """Refresh CLOB collateral snapshot (no secrets logged).
+
+        A failed balance/allowance read must NOT write available=0 and starve
+        quoting. Keep the last known-good snapshot; if none exists yet, leave
+        None so budget gates fail closed (skip place) without inventing cash.
+        """
         now = time.time()
         if (
             not force
@@ -1489,6 +1494,13 @@ class Engine:
             bal = await self.gateway.collateral_balance()
         except Exception as exc:  # noqa: BLE001
             log.warning("collateral_refresh_failed", err=str(exc)[:120])
+            return self._collateral_usdc
+        if bal is None:
+            log.warning(
+                "collateral_refresh_failed",
+                err="balance_allowance unavailable",
+                kept=None if self._collateral_usdc is None else round(self._collateral_usdc, 6),
+            )
             return self._collateral_usdc
         self._collateral_usdc = bal
         self._collateral_ts = now

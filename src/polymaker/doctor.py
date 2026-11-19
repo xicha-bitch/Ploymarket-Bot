@@ -226,14 +226,6 @@ async def _top_political_token(cfg: Config) -> str | None:
 
 def _extract_balance(ba: dict[str, Any]) -> float | None:
     """CLOB collateral balance is always micro-units (6 decimals); always /1e6."""
-    if not isinstance(ba, dict):
-        return None
-    from polymaker.execution.gateway import collateral_raw_to_usd
+    from polymaker.execution.gateway import parse_collateral_balance
 
-    for k in ("balance", "collateral", "amount"):
-        if k in ba:
-            try:
-                return collateral_raw_to_usd(ba[k])
-            except (ValueError, TypeError):
-                return None
-    return None
+    return parse_collateral_balance(ba)

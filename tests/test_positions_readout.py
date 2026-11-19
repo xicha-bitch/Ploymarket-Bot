@@ -14,6 +14,7 @@ from polymaker.execution.gateway import (
     PositionsReadError,
     collateral_raw_to_usd,
     map_position_row,
+    parse_collateral_balance,
     parse_v2_positions_page,
 )
 from polymaker.doctor import _extract_balance
@@ -42,6 +43,19 @@ def test_collateral_raw_always_divides_by_1e6():
     assert collateral_raw_to_usd(0) == 0.0
     assert _extract_balance({"balance": "934967"}) == pytest.approx(0.934967)
     assert _extract_balance({"balance": 500000}) == pytest.approx(0.5)
+
+
+def test_parse_collateral_balance_failed_read_is_none_not_zero():
+    """Empty/failed balance_allowance must not become available=0."""
+    assert parse_collateral_balance({}) is None
+    assert parse_collateral_balance(None) is None
+    assert parse_collateral_balance("boom") is None
+    assert parse_collateral_balance({"allowance": "1"}) is None  # no balance key
+    assert parse_collateral_balance({"balance": "not-a-number"}) is None
+    # Successful zero is still zero (real empty wallet).
+    assert parse_collateral_balance({"balance": 0}) == 0.0
+    assert parse_collateral_balance({"balance": "0"}) == 0.0
+    assert parse_collateral_balance({"balance": "1005867"}) == pytest.approx(1.005867)
 
 
 # ── row / page mapping ──────────────────────────────────────────────────
@@ -234,3 +248,27 @@ def test_positions_missing_funder_raises():
         asyncio.run(gw.positions())
     with pytest.raises(PositionsReadError, match="no funder"):
         asyncio.run(_gw(funder="0xPAPER").positions())
+
+
+async def test_collateral_balance_failed_allowance_is_none_not_zero():
+    """Live bug: balance_allowance_failed → {} → available=0 starved quoting."""
+    gw = _gw()
+    gw._client = object()  # noqa: SLF001 — present so balance_allowance tries I/O
+
+    async def _fail_ba() -> dict:
+        return {}
+
+    async def _ok_ba() -> dict:
+        return {"balance": "1005867"}
+
+    async def _zero_ba() -> dict:
+        return {"balance": 0}
+
+    gw.balance_allowance = _fail_ba  # type: ignore[method-assign]
+    assert await gw.collateral_balance() is None
+
+    gw.balance_allowance = _ok_ba  # type: ignore[method-assign]
+    assert await gw.collateral_balance() == pytest.approx(1.005867)
+
+    gw.balance_allowance = _zero_ba  # type: ignore[method-assign]
+    assert await gw.collateral_balance() == 0.0

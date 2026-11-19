@@ -73,6 +73,9 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
                   f"spread {round(best_ask - best_bid, 4)} · tick {tick:g}[/dim]")
 
     bal0 = await gw.collateral_balance()
+    if bal0 is None:
+        console.print("  [red]✗ starting collateral unread (balance/allowance failed)[/red]")
+        return False
     console.print(f"  [dim]starting balance: {bal0:.4f} pUSD[/dim]\n")
 
     # ── 1. LIMIT: rest + cancel ─────────────────────────────────────────
@@ -123,9 +126,12 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
     # ── cost ────────────────────────────────────────────────────────────
     await asyncio.sleep(2.0)
     bal1 = await gw.collateral_balance()
-    cost = bal0 - bal1
-    console.print(f"\n  [bold]round-trip cost: {cost:.4f} pUSD[/bold] "
-                  f"[dim](spread + taker fees; balance {bal0:.2f} → {bal1:.2f})[/dim]")
+    if bal1 is None:
+        console.print("\n  [yellow]! ending collateral unread — cost unknown[/yellow]")
+    else:
+        cost = bal0 - bal1
+        console.print(f"\n  [bold]round-trip cost: {cost:.4f} pUSD[/bold] "
+                      f"[dim](spread + taker fees; balance {bal0:.2f} → {bal1:.2f})[/dim]")
     console.print(f"\n[bold]{'ALL GOOD' if ok else 'CHECK LOGS'}[/bold]")
     return ok
 

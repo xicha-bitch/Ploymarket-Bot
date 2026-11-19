@@ -10,6 +10,7 @@ from __future__ import annotations
 from polymaker.config import StrategyProfile
 from polymaker.domain import MarketMeta
 from polymaker.marketdata.orderbook import BookView
+from polymaker.strategy.budget import BUDGET_TOLERANCE_USDC
 
 _EPS = 1e-9
 
@@ -154,4 +155,4 @@ def is_min_size_feasible(
         return True
     if price <= 0 or min_order_size <= 0:
         return True
-    return (price * min_order_size) <= headroom_usdc + _EPS
+    return (price * min_order_size) <= headroom_usdc + BUDGET_TOLERANCE_USDC

@@ -185,6 +185,99 @@ def test_health_records_advance_and_redact(tmp_path) -> None:
     s.close()
 
 
+async def test_positions_429_blind_pulls_then_recovery_requotes(tmp_path, meta) -> None:
+    from tests.test_engine import _feed_book
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng._trades_backfill_ok = True
+    eng._user_started = False
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) > 0
+    placed_before = len(eng.gateway.placed)  # type: ignore[attr-defined]
+
+    eng._positions_healthy = False
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) == 0
+
+    eng._positions_healthy = True
+    eng._maybe_requote_after_recovery_gate(reason="positions_reconcile_recovered")
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) > 0
+    assert len(eng.gateway.placed) > placed_before  # type: ignore[attr-defined]
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_positions_still_429_does_not_requote(tmp_path, meta) -> None:
+    from tests.test_engine import _feed_book
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng._trades_backfill_ok = True
+    eng._user_started = False
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)
+    placed_before = len(eng.gateway.placed)  # type: ignore[attr-defined]
+
+    eng._positions_healthy = False
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) == 0
+
+    # Gate still blind — must not repost even if quoter wakes.
+    eng._maybe_requote_after_recovery_gate(reason="positions_reconcile_recovered")
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) == 0
+    assert len(eng.gateway.placed) == placed_before  # type: ignore[attr-defined]
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_reconcile_positions_recovered_requotes_via_loop(tmp_path, meta) -> None:
+    from tests.test_engine import _feed_book
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.engine.reconcile_interval_s = 0.05
+    eng._trades_backfill_ok = True
+    eng._user_started = False
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) > 0
+
+    class Flaky(StubGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        async def positions(self):
+            if self.fail:
+                raise PositionsReadError(
+                    "HTTP 429", status_code=429, retry_after_s=0.08
+                )
+            return {}
+
+    flaky = Flaky()
+    eng.gateway = flaky  # type: ignore[assignment]
+    eng._running = True
+    task = asyncio.create_task(eng._reconcile_loop())
+    try:
+        await asyncio.sleep(0.12)
+        assert eng._positions_healthy is False
+        await eng._recompute(meta.condition_id)
+        assert len(eng.state.orders) == 0
+        flaky.fail = False
+        await asyncio.sleep(0.25)
+        assert eng._positions_healthy is True
+        await eng._recompute(meta.condition_id)
+        assert len(eng.state.orders) > 0
+    finally:
+        eng._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        eng.state.close()
+        eng.catalog.close()
+
+
 def test_market_cold_empty_not_disconnected() -> None:
     md = MarketDataService()
     md.connected = True

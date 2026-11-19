@@ -81,6 +81,19 @@ class MarketDataService:
                 subs.append(tok)
         self._subs = subs
 
+    def subscription_tokens(self) -> tuple[str, ...]:
+        return tuple(self._subs)
+
+    async def close_socket(self) -> None:
+        """Drop the live socket so ``run`` resubscribes with the current assets."""
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001 — reconnect loop owns the failure
+            return
+
     def view(self, token_id: str) -> BookView:
         book = self.books.get(token_id)
         return book.view() if book else _empty_view()

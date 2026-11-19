@@ -121,6 +121,24 @@ def collateral_raw_to_usd(raw: Any) -> float:
     return float(raw) / 1e6
 
 
+def parse_collateral_balance(ba: Any) -> float | None:
+    """Parse a balance/allowance snapshot into USD, or None if unreadable.
+
+    A failed ``balance_allowance`` call returns ``{}`` — that must NOT become
+    ``0.0`` (which would starve quoting as if cash were gone). A successful
+    response with balance ``0`` still returns ``0.0``.
+    """
+    if not isinstance(ba, dict) or not ba:
+        return None
+    for k in ("balance", "collateral", "amount"):
+        if k in ba:
+            try:
+                return collateral_raw_to_usd(ba[k])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
 def parse_v2_positions_page(body: Any) -> tuple[list[Any], str | None]:
     """Parse `{data, pagination}` → (rows, next_cursor_or_None).
 
@@ -560,16 +578,14 @@ class ExecutionGateway:
             log.warning("token_balances_failed", err=str(exc))
             return None
 
-    async def collateral_balance(self) -> float:
-        """pUSD balance (float) on the funder. CLOB raw is always /1e6 micro-units."""
+    async def collateral_balance(self) -> float | None:
+        """pUSD balance on the funder, or None when the read/parse failed.
+
+        CLOB raw is always /1e6 micro-units. Callers must NOT treat None as
+        zero cash — keep last known-good or fail closed (skip new quotes).
+        """
         ba = await self.balance_allowance()
-        for k in ("balance", "collateral", "amount"):
-            if isinstance(ba, dict) and k in ba:
-                try:
-                    return collateral_raw_to_usd(ba[k])
-                except (ValueError, TypeError):
-                    return 0.0
-        return 0.0
+        return parse_collateral_balance(ba)
 
     # ── heartbeat (dead-man switch) ─────────────────────────────────────
     async def heartbeat(self) -> bool:

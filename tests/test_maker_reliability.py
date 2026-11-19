@@ -122,6 +122,65 @@ def test_thin_book_clamps_to_exchange_min_not_rewards(meta, profile):
         assert deep_sz >= thin_sz
 
 
+def test_thin_book_ignores_budget_slice_inflation(meta, profile):
+    """A budget slice must not inflate a thin book toward rewardsMinSize."""
+    from dataclasses import replace
+
+    fat = replace(meta, rewards_min_size=200.0, min_order_size=5.0)
+    sticky = profile.with_overrides(
+        {
+            "layers": 1,
+            "reprice_ticks": 3,
+            "reward_size_mult": 1.0,
+            "thin_depth_mult": 1.0,
+            "base_size_usdc": 0.95,
+        }
+    )
+    # Cheap YES so 5-share min fits a $1 headroom; expensive NO is dropped.
+    thin = construct_quotes(
+        QuoteInputs(
+            meta=fat,
+            regime=Regime.QUIET,
+            fv=0.05,
+            vol_short=0.0,
+            toxicity=0.0,
+            yes_view=view(0.04, 0.06, 5, 5),
+            no_view=view(0.94, 0.96, 5, 5),
+            pos_yes=Position("yes-token"),
+            pos_no=Position("no-token"),
+            profile=sticky,
+            now=1.0,
+            headroom_usdc=1.0,
+            size_notional_usdc=0.95,
+        )
+    )
+    thin_buys = [q for q in thin.quotes if q.side is Side.BUY]
+    assert thin_buys
+    assert all(q.size == 5.0 for q in thin_buys)
+    assert all(q.size < fat.rewards_min_size * sticky.reward_size_mult for q in thin_buys)
+
+    deep = construct_quotes(
+        QuoteInputs(
+            meta=fat,
+            regime=Regime.QUIET,
+            fv=0.05,
+            vol_short=0.0,
+            toxicity=0.0,
+            yes_view=view(0.04, 0.06, 5000, 5000),
+            no_view=view(0.94, 0.96, 5000, 5000),
+            pos_yes=Position("yes-token"),
+            pos_no=Position("no-token"),
+            profile=sticky,
+            now=1.0,
+            headroom_usdc=1.0,
+            size_notional_usdc=0.95,
+        )
+    )
+    deep_buys = [q for q in deep.quotes if q.side is Side.BUY and q.token_id == "yes-token"]
+    assert deep_buys
+    assert max(q.size for q in deep_buys) > 5.0
+
+
 def test_chunk_quotes_respects_batch_cap():
     qs = [Quote("t", Side.BUY, 0.4, 10.0) for _ in range(12)]
     batches = chunk_quotes(qs, 5)

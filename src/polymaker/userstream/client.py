@@ -46,6 +46,7 @@ class UserStream:
         self._proxy = proxy
         self._on_reconnect = on_reconnect or (lambda: None)
         self._markets: list[str] = []
+        self._ws: Any = None
         self._stop = asyncio.Event()
         # Connection health. ping_timeout guarantees a dead link flips
         # `connected` to False within ~15s, so the engine can go blind-safe.
@@ -56,7 +57,20 @@ class UserStream:
         self.message_count: int = 0
 
     def set_markets(self, condition_ids: list[str]) -> None:
-        self._markets = condition_ids
+        self._markets = list(condition_ids)
+
+    def subscription_markets(self) -> tuple[str, ...]:
+        return tuple(self._markets)
+
+    async def close_socket(self) -> None:
+        """Drop the live socket so ``run`` resubscribes with the current markets."""
+        ws = getattr(self, "_ws", None)
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001 — reconnect loop owns the failure
+            return
 
     async def run(self) -> None:
         backoff = 1.0
@@ -87,6 +101,7 @@ class UserStream:
         if self._proxy:
             kwargs["proxy"] = self._proxy
         async with websockets.connect(self._url, **kwargs) as ws:
+            self._ws = ws
             await ws.send(json.dumps(sub))
             self.connected = True
             is_reconnect = self._ever_connected

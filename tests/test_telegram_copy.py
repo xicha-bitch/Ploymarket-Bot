@@ -49,6 +49,24 @@ def test_status_uses_real_newlines_and_chinese_labels() -> None:
     assert text.count("\n") <= 8
 
 
+def test_status_active_markets_is_one_short_line() -> None:
+    text = format_status_report(
+        markets=3,
+        open_orders=2,
+        balance_clob=1.0,
+        resting_buy=0.2,
+        position_mark=0.0,
+        fills=0,
+        session_equity=1.0,
+        session_daily_delta=None,
+        stop_requested=False,
+        positions=None,
+        active_markets="活跃 iran-blockade, other-mkt | 退出 old-mkt",
+    )
+    assert "活跃 iran-blockade, other-mkt | 退出 old-mkt" in text
+    assert text.count("\n") <= 9
+
+
 def test_status_api_fail_unknown() -> None:
     text = format_status_report(
         markets=0,

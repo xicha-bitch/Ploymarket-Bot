@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import time
 
+import pytest
+
 from polymaker.config import Config, PathsConfig, StrategyProfile
-from polymaker.domain import Side
+from polymaker.domain import OpenOrder, OrderState, Quote, Side
 from polymaker.engine import Engine
 from polymaker.strategy.regime import RegimeMachine
 from tests.stub_gateway import StubGateway
@@ -159,3 +161,98 @@ async def test_supervise_restarts_with_backoff_then_resets(tmp_path, meta):
             await sup
         eng.state.close()
         eng.catalog.close()
+
+
+async def test_exit_only_market_sells_inventory_and_skips_buys(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    eng.state.set_position(meta.yes.token_id, 10.0, 0.40)
+    eng._exit_only.add(meta.condition_id)
+    await eng._recompute(meta.condition_id)
+    orders = eng.state.orders_for(meta.yes.token_id) + eng.state.orders_for(meta.no.token_id)
+    assert orders, "exit quote missing"
+    assert all(o.side is Side.SELL for o in orders)
+    eng.state.close()
+    eng.catalog.close()
+
+
+def test_allocated_headroom_caps_one_market(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.selection.auto = True
+    eng._buy_budget[meta.condition_id] = 0.15
+    eng._collateral_usdc = 1.0
+    headroom = eng._entry_headroom(meta)
+    assert headroom is not None
+    assert headroom <= 0.15 + 1e-9
+    eng.state.close()
+    eng.catalog.close()
+
+
+def test_entry_headroom_keeps_a_live_bid_in_the_slice(tmp_path, meta):
+    """API balance already reserved the bid; the target must still include it."""
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.selection.auto = True
+    eng._buy_budget[meta.condition_id] = 0.50
+    eng._collateral_usdc = 0.46
+    eng.state.upsert_order(OpenOrder("oid", meta.yes.token_id, Side.BUY, 0.094, 5.0, OrderState.LIVE))
+    headroom = eng._entry_headroom(meta)
+    assert headroom is not None
+    assert headroom + 1e-9 >= 0.47
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_refresh_collateral_keeps_last_good_on_failed_read(tmp_path, meta):
+    """Failed balance/allowance must not write available=0 and starve quoting."""
+
+    class FailBal(StubGateway):
+        async def collateral_balance(self):
+            return None
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway = FailBal()  # type: ignore[assignment]
+    eng._collateral_usdc = 1.005867
+    eng._collateral_ts = 0.0  # force refresh
+    kept = await eng._refresh_collateral(force=True)
+    assert kept == pytest.approx(1.005867)
+    assert eng._collateral_usdc == pytest.approx(1.005867)
+
+    # Budget filter still sees last-good cash (not a false zero).
+    q = Quote(meta.yes.token_id, Side.BUY, 0.10, 5.0)
+    kept_quotes = await eng._budget_filter_quotes(meta.condition_id, meta, [q])
+    assert kept_quotes == [q]
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_refresh_collateral_writes_real_zero_and_fails_closed_without_prior(
+    tmp_path, meta
+):
+    class ZeroBal(StubGateway):
+        async def collateral_balance(self):
+            return 0.0
+
+    class FailBal(StubGateway):
+        async def collateral_balance(self):
+            return None
+
+    eng = _engine_with_market(tmp_path, meta)
+    # Successful zero is authoritative.
+    eng.gateway = ZeroBal()  # type: ignore[assignment]
+    eng._collateral_usdc = 1.0
+    eng._collateral_ts = 0.0
+    assert await eng._refresh_collateral(force=True) == 0.0
+    assert eng._collateral_usdc == 0.0
+
+    # No prior snapshot + failed read → stay None → skip place (fail closed).
+    eng2 = _engine_with_market(tmp_path, meta)
+    eng2.gateway = FailBal()  # type: ignore[assignment]
+    eng2._collateral_usdc = None
+    eng2._collateral_ts = 0.0
+    assert await eng2._refresh_collateral(force=True) is None
+    q = Quote(meta.yes.token_id, Side.BUY, 0.10, 5.0)
+    assert await eng2._budget_filter_quotes(meta.condition_id, meta, [q]) == []
+    eng.state.close()
+    eng.catalog.close()
+    eng2.state.close()
+    eng2.catalog.close()

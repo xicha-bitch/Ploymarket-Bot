@@ -94,9 +94,6 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     u = _clamp(net_shares / q_max_shares, -1.0, 1.0) if q_max_shares > 0 else 0.0
     reward_floor = m.rewards_min_size * p.reward_size_mult  # scoring size w/ margin
     size_notional = p.base_size_usdc if inp.size_notional_usdc is None else inp.size_notional_usdc
-    # An explicit slice is cash we intend to post. A thin book must not
-    # shrink it back to a 5-share dust bid and leave the rest idle.
-    deploy_slice = inp.size_notional_usdc is not None
 
     skew = p.gamma * inp.vol_short * u
 
@@ -141,8 +138,10 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
                 size_notional, price, m.min_order_size, inp.headroom_usdc
             )
             raw = _size_shares(leg, price, common_scale * (1 - max(u, 0.0)), m)
+            # Thin/gappy → exchange-min only, even when sizing to a budget slice.
+            # Never inflate toward rewardsMinSize on a hollow book.
             sized = apply_min_size_clamp(
-                raw, scale=1.0 if deploy_slice else yes_book_scale, meta=m, profile=p
+                raw, scale=yes_book_scale, meta=m, profile=p
             )
             before = len(quotes)
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
@@ -163,7 +162,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
             )
             raw = _size_shares(leg, price, common_scale * (1 - max(-u, 0.0)), m)
             sized = apply_min_size_clamp(
-                raw, scale=1.0 if deploy_slice else no_book_scale, meta=m, profile=p
+                raw, scale=no_book_scale, meta=m, profile=p
             )
             before = len(quotes)
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,

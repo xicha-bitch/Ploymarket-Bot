@@ -17,9 +17,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from polymaker.catalog.scoring import extremity, reward_density
+from polymaker.catalog.scoring import (
+    book_depth_quality,
+    extremity,
+    is_extremely_thin_book,
+    reward_density,
+)
 from polymaker.domain import MarketMeta
 from polymaker.strategy.budget import (
+    BUDGET_TOLERANCE_USDC,
     BudgetSlice,
     BudgetSliceInput,
     allocate_buy_budgets,
@@ -58,6 +64,10 @@ class SelectCandidate:
     hours_to_end: float | None = None
     slug: str = ""
     price_known: bool = True
+    # None = unknown (do not hard-block on depth). Known hollow / gappy
+    # books are rejected for new entry unless pinned or already held.
+    liquidity_num: float | None = None
+    air_gap_ticks: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,13 +155,18 @@ def score_market_for_selection(
     else:
         spread_q = 0.0
 
-    depth_q = min(1.0, math.log1p(max(0.0, meta.liquidity_num)) / math.log1p(5000.0))
+    # Hard-zero depth below ENTRY_LIQUIDITY_FLOOR; heavy downrank until soft.
+    depth_q = book_depth_quality(meta.liquidity_num)
     time_q = _time_quality(hours, min_hours_to_end)
     ext = extremity(meta)
 
     combined = (
         0.40 * reward + 0.25 * spread_q + 0.20 * depth_q + 0.15 * time_q
     ) * (1.0 - 0.20 * ext)
+    # Extremely thin books are not just discounted — zero the rank so a
+    # hollow high-reward name cannot outrank a fundable deeper book.
+    if is_extremely_thin_book(meta.liquidity_num):
+        combined = 0.0
     return SelectionScore(
         condition_id=meta.condition_id,
         reward=round(reward, 6),
@@ -196,6 +211,7 @@ def market_entry_feasible(
             hours_to_end=hours,
             price_known=notional is not None,
             filled_usdc=filled_usdc,
+            liquidity_num=meta.liquidity_num,
         ),
         max_market_notional_usdc=max_market_notional_usdc,
         max_total_exposure_usdc=max_total_exposure_usdc,
@@ -216,6 +232,8 @@ def candidate_entry_feasible(
 ) -> bool:
     """Hard entry filter. Inventory retention is applied by the picker."""
     if not cand.price_known or cand.min_entry_notional <= _EPS:
+        return False
+    if is_extremely_thin_book(cand.liquidity_num, air_gap_ticks=cand.air_gap_ticks):
         return False
     cash = max(0.0, available_usdc - max(0.0, fee_buffer_usdc))
     market_room = max_market_notional_usdc - max(0.0, cand.filled_usdc)
@@ -246,6 +264,11 @@ def select_and_allocate(
 ) -> tuple[PlannedMarket, ...]:
     """Pick up to ``max_markets`` entry names plus any exit-only inventory."""
     cap_n = max(1, max_markets)
+    pool_cash = max(
+        0.0,
+        available_usdc - max(0.0, fee_buffer_usdc) - max(0.0, resting_buy_elsewhere_usdc),
+    )
+    pool_usdc = min(pool_cash, max(0.0, max_total_exposure_usdc - max(0.0, filled_total_usdc)))
     feasible: list[SelectCandidate] = []
     for cand in candidates:
         if cand.pinned or candidate_entry_feasible(
@@ -263,6 +286,7 @@ def select_and_allocate(
         previous=set(previous_ids),
         margin=max(0.0, hysteresis_margin),
         max_markets=cap_n,
+        pool_usdc=pool_usdc,
     )
     chosen, budgets = _fit_budgets(
         chosen,
@@ -342,9 +366,19 @@ def _prefer_entries(
     previous: set[str],
     margin: float,
     max_markets: int,
+    pool_usdc: float | None = None,
 ) -> list[SelectCandidate]:
-    def _key(cand: SelectCandidate) -> tuple[float, str]:
-        return (-cand.score, cand.condition_id)
+    """Greedy pick by score, preferring a pack whose exchange mins can rest.
+
+    Fresh names that would push the group's minimums past the cash/total pool
+    are skipped so we keep several fundable bids instead of four starved ones.
+    Pinned and inventory incumbents are still admitted; ``_fit_budgets`` sheds
+    what cannot fund.
+    """
+
+    def _key(cand: SelectCandidate) -> tuple[float, float, str]:
+        # Cheaper mins win ties so a ~$1 book packs more resting quotes.
+        return (-cand.score, cand.min_entry_notional, cand.condition_id)
 
     pinned = sorted([c for c in feasible if c.pinned], key=_key)
     incumbents = sorted(
@@ -358,6 +392,14 @@ def _prefer_entries(
 
     selected: list[SelectCandidate] = []
     seen: set[str] = set()
+
+    def mins_sum(group: list[SelectCandidate]) -> float:
+        return sum(max(0.0, c.min_entry_notional) for c in group if c.price_known)
+
+    def fits_pool(cand: SelectCandidate, group: list[SelectCandidate]) -> bool:
+        if pool_usdc is None or cand.pinned or cand.has_inventory:
+            return True
+        return mins_sum(group) + max(0.0, cand.min_entry_notional) <= pool_usdc + BUDGET_TOLERANCE_USDC
 
     def add(cand: SelectCandidate) -> None:
         if cand.condition_id in seen:
@@ -387,13 +429,16 @@ def _prefer_entries(
                 break
             if not allow_same and same_event(cand):
                 continue
+            if not fits_pool(cand, selected):
+                continue
             add(cand)
 
     for cand in fresh:
         if cand.condition_id in seen:
             continue
         if room() > 0:
-            add(cand)
+            if fits_pool(cand, selected):
+                add(cand)
             continue
         victims = [
             s
@@ -410,7 +455,10 @@ def _prefer_entries(
             for s in selected
         ):
             continue
-        selected = [s for s in selected if s.condition_id != weakest.condition_id]
+        trial = [s for s in selected if s.condition_id != weakest.condition_id]
+        if not fits_pool(cand, trial):
+            continue
+        selected = trial
         seen.discard(weakest.condition_id)
         add(cand)
     return selected

@@ -65,6 +65,8 @@ def _cand(
     hours: float | None = 24.0 * 20.0,
     price_known: bool = True,
     filled: float = 0.0,
+    liquidity: float | None = 5000.0,
+    air_gap: float | None = None,
 ) -> SelectCandidate:
     return SelectCandidate(
         condition_id=cid,
@@ -77,6 +79,8 @@ def _cand(
         hours_to_end=hours,
         slug=cid,
         price_known=price_known,
+        liquidity_num=liquidity,
+        air_gap_ticks=air_gap,
     )
 
 
@@ -112,12 +116,91 @@ def test_score_rewards_spread_depth_and_time() -> None:
     thin = score_market_for_selection(_meta("thin", liquidity=10.0), now=NOW)
     assert deep.depth > thin.depth
     assert deep.score > thin.score
+    assert thin.depth == 0.0
+    assert thin.score == 0.0
 
     far = score_market_for_selection(_meta("far", hours=24.0 * 40.0), now=NOW)
     soon = score_market_for_selection(_meta("soon", hours=10.0), now=NOW)
     assert far.time_to_resolution > soon.time_to_resolution
     assert far.score > soon.score
     assert base.condition_id == "base"
+
+
+def test_extremely_thin_book_is_blocked_for_new_entry() -> None:
+    """Hollow / gappy books: hard-block new entry; pinned + inventory still ok."""
+    hollow = _meta("hollow", bid=0.04, ask=0.06, liquidity=10.0, reward=200.0)
+    deep = _meta("deep", bid=0.04, ask=0.06, liquidity=5000.0, reward=20.0)
+    caps = {
+        "now": NOW,
+        "max_market_notional_usdc": 1.0,
+        "max_total_exposure_usdc": 1.0,
+        "available_usdc": 1.0,
+        "fee_buffer_usdc": 0.01,
+        "min_hours_to_end": 6.0,
+    }
+    assert not market_entry_feasible(hollow, **caps)
+    assert market_entry_feasible(deep, **caps)
+    # Pinned / inventory keep the subscription (exit-only / quoter enforces).
+    assert market_entry_feasible(hollow, **caps, pinned=True)
+    assert market_entry_feasible(hollow, **caps, has_inventory=True)
+
+    # High-reward hollow name must not outrank a deeper fundable book.
+    hollow_s = score_market_for_selection(hollow, now=NOW)
+    deep_s = score_market_for_selection(deep, now=NOW)
+    assert hollow_s.score == 0.0
+    assert deep_s.score > hollow_s.score
+
+    # Optional live air-gap also blocks when known.
+    gappy = _plan(
+        candidates=[
+            _cand("gap", 5.0, minimum=0.08, liquidity=5000.0, air_gap=12.0),
+            _cand("ok", 1.0, minimum=0.08, liquidity=5000.0),
+        ],
+        max_markets=2,
+        max_market_notional_usdc=1.0,
+    )
+    ids = [p.condition_id for p in gappy if p.role == "entry"]
+    assert ids == ["ok"]
+
+
+def test_prefer_fundable_pack_over_starved_max_markets() -> None:
+    """Four names that cannot all fund: keep a resting pack, not four zeros."""
+    starved = _plan(
+        candidates=[
+            _cand("a", 4.0, minimum=0.40, liquidity=5000.0),
+            _cand("b", 3.0, minimum=0.40, liquidity=5000.0),
+            _cand("c", 2.0, minimum=0.40, liquidity=5000.0),
+            _cand("d", 1.0, minimum=0.40, liquidity=5000.0),
+        ],
+        max_markets=4,
+        max_market_notional_usdc=1.0,
+    )
+    entries = [p for p in starved if p.role == "entry"]
+    assert 1 <= len(entries) <= 2
+    assert all(p.buy_budget_usdc + 1e-9 >= 0.40 for p in entries)
+    assert sum(p.buy_budget_usdc for p in entries) <= 0.99 + 1e-9
+
+    # Top scores that cannot share the dollar: skip the next expensive mins and
+    # fill remaining slots with cheaper names that can actually rest together.
+    packed = _plan(
+        candidates=[
+            _cand("e1", 10.0, minimum=0.55, liquidity=5000.0),
+            _cand("e2", 9.0, minimum=0.55, liquidity=5000.0),
+            _cand("e3", 8.0, minimum=0.55, liquidity=5000.0),
+            _cand("e4", 7.0, minimum=0.55, liquidity=5000.0),
+            _cand("c1", 1.0, minimum=0.08, liquidity=5000.0),
+            _cand("c2", 0.9, minimum=0.08, liquidity=5000.0),
+            _cand("c3", 0.8, minimum=0.08, liquidity=5000.0),
+        ],
+        max_markets=4,
+        max_market_notional_usdc=1.0,
+    )
+    packed_ids = [p.condition_id for p in packed if p.role == "entry"]
+    assert packed_ids[0] == "e1"
+    assert "e2" not in packed_ids and "e3" not in packed_ids and "e4" not in packed_ids
+    assert set(packed_ids) == {"e1", "c1", "c2", "c3"}
+    assert all(p.buy_budget_usdc > 0.0 for p in packed if p.role == "entry")
+    assert sum(p.buy_budget_usdc for p in packed if p.role == "entry") > 0.90
 
 
 def test_feasibility_requires_min_size_times_price_inside_market_cap() -> None:

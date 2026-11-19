@@ -571,6 +571,7 @@ class Engine:
                     hours_to_end=scored.hours_to_end,
                     slug=view.slug,
                     price_known=scored.min_entry_notional is not None,
+                    liquidity_num=view.liquidity_num,
                 )
             )
         previous = [cid for cid in self.metas if cid not in self._exit_only]

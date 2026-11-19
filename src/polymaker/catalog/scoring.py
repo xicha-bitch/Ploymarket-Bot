@@ -7,9 +7,19 @@ Pure functions over MarketMeta.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from polymaker.domain import MarketMeta
+
+# Hollow Gamma books are traps for a ~$1 post-only micro maker: one 5-share
+# fill can eat most of the bankroll into an air pocket. Hard-block new entry
+# below the floor; heavily downrank until the soft depth mark.
+ENTRY_LIQUIDITY_FLOOR = 100.0
+ENTRY_LIQUIDITY_SOFT = 1000.0
+# Optional live air-gap (ticks under the bid). When known and this wide, block
+# new entry the same way a thin Gamma liquidity_num would.
+ENTRY_AIR_GAP_TICKS = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +30,47 @@ class MarketScore:
     spread: float
     extremity: float  # 0 = mid ~0.5 (good), 1 = near 0/1 (bad payoff asymmetry)
     score: float
+
+
+def is_extremely_thin_book(
+    liquidity_num: float | None,
+    *,
+    air_gap_ticks: float | None = None,
+    liquidity_floor: float = ENTRY_LIQUIDITY_FLOOR,
+    air_gap_limit: float = ENTRY_AIR_GAP_TICKS,
+) -> bool:
+    """True when a book is too hollow / gappy for a new micro entry.
+
+    ``liquidity_num is None`` means unknown (do not hard-block). A known
+    air-gap at or above ``air_gap_limit`` also blocks.
+    """
+    if liquidity_num is not None and liquidity_num < liquidity_floor:
+        return True
+    if air_gap_ticks is not None and air_gap_ticks >= air_gap_limit:
+        return True
+    return False
+
+
+def book_depth_quality(
+    liquidity_num: float,
+    *,
+    soft: float = ENTRY_LIQUIDITY_SOFT,
+    floor: float = ENTRY_LIQUIDITY_FLOOR,
+) -> float:
+    """Depth quality in ``[0, 1]`` for selection / scanner ranking.
+
+    Below ``floor`` → 0 (hard-block territory). Between floor and soft →
+    log ramp. At/above soft → 1.
+    """
+    liq = max(0.0, liquidity_num)
+    if liq < floor:
+        return 0.0
+    if soft <= floor:
+        return 1.0 if liq >= soft else 0.0
+    if liq >= soft:
+        return 1.0
+    # log ramp so slightly-above-floor books stay heavily discounted
+    return min(1.0, math.log1p(liq - floor) / math.log1p(soft - floor))
 
 
 def _mid(m: MarketMeta) -> float:
@@ -83,9 +134,8 @@ def score_market(m: MarketMeta) -> MarketScore:
     our_share = min(0.5, ref / max(m.liquidity_num, ref))  # you won't own a whole pool
     income = rd + rp * our_share
     penalty = (1.0 - 0.5 * ext) * (1.0 / (1.0 + spread * 20.0))
-    # viability: a market needs real book depth to actually quote — otherwise a
-    # near-zero-liquidity market games "our share" to the top of the ranking
-    viability = min(1.0, m.liquidity_num / 2000.0)
+    # viability: hollow books must not game "our share" to the top of ranking
+    viability = book_depth_quality(m.liquidity_num, soft=2000.0, floor=ENTRY_LIQUIDITY_FLOOR)
     return MarketScore(
         condition_id=m.condition_id,
         reward_density=round(rd, 3),
